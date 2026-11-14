@@ -6,7 +6,7 @@
 
 用一根滑条，为 Android 应用存储和 Linux 游戏库分配 TF 卡空间。本应用是 [Armada Installer](https://github.com/mydanyi/armada-installer) 的安卓配套工具，供运行 Android 与 ArmadaOS 的掌机使用。
 
-[下载 APK](https://github.com/mydanyi/smart-tf-allocator/releases/latest) · [Armada Installer](https://github.com/mydanyi/armada-installer) · [反馈问题](https://github.com/mydanyi/smart-tf-allocator/issues)
+[下载 APK](https://github.com/ArmadaOS-Freedom/smart-tf-allocator/releases/latest) · [Armada Installer](https://github.com/mydanyi/armada-installer) · [反馈问题](https://github.com/ArmadaOS-Freedom/smart-tf-allocator/issues)
 
 ![智能TF卡分配器在 AYN Odin 3 上的实机界面](docs/screenshot-zh-CN.png)
 
@@ -16,6 +16,8 @@
 
 - 左右拖动滑条，选择分配给 Android 和 Linux 的空间，实时查看预计容量；滑条中段（Android 比例 10%–90%）为混合分配，滑到两端则整张卡只归一个系统使用。
 - 初始化 Android 内部扩展存储，供受支持的应用及数据使用，也支持整张卡作为 Android 存储。
+- 通过迁移管理，在机身和 TF 卡的 Android 空间之间迁移受支持的用户应用；固件支持时也可迁移主共享存储。迁移后的应用仍保留在列表中，系统和出厂预装应用不会列出。
+- 已分配空间以摘要展示，需要时再选择重新分配；横屏运行日志在主面板下方展开，作者链接和版本号位于紧凑的同一行页脚。
 - 为 Linux 预留配套分区，让 Armada Installer 识别并格式化为游戏库，也可把整张卡交给 Linux。
 - 未 root 的设备可通过 Shizuku 使用；已 root 的设备可通过 root 启动 Shizuku。
 - 支持未 root 且固件禁止读取存储卡硬件 CID 的设备：此时应用改用存储卡上的卷来识别卡片，无需 root 或修改系统安全设置。以此方式创建的 Linux 空间需要 Armada Installer 0.5.0 或更高版本；能正常读取 CID 的存储卡保持原有流程。
@@ -34,7 +36,7 @@
 
 ## 使用步骤
 
-1. 备份 TF 卡，在 [发布页面](https://github.com/mydanyi/smart-tf-allocator/releases/latest) 下载并安装 APK。
+1. 备份 TF 卡，在 [发布页面](https://github.com/ArmadaOS-Freedom/smart-tf-allocator/releases/latest) 下载并安装 APK。
 2. 启动 Shizuku，向智能TF卡分配器授权。Android 11 及以上可通过无线调试在设备上启动，无需 root；其他启动方式请参考 [Shizuku 官方指南](https://shizuku.rikka.app/zh-hans/guide/setup/)，并以当前安装版本显示的步骤为准。设备重启后，如 Shizuku 未运行，请重新启动。
 3. 打开本应用并选择 TF 卡，必要时点击 **重新扫描**。
 4. 拖动滑条选择分配比例：滑到两端时整张卡归一个系统，Android 比例 10%–90% 时与 Linux 共用。显示容量为估算值，已考虑 Android 存储元数据开销。
@@ -71,7 +73,7 @@ Android 机器人图形由 Google 创作并分享的作品复制或修改，按 
 
 ## 支持与交流
 
-应用问题请在本仓库的 [Issues](https://github.com/mydanyi/smart-tf-allocator/issues) 反馈；Linux 游戏库配置请查看 [Armada Installer](https://github.com/mydanyi/armada-installer)；系统镜像及设备支持请查看 [ArmadaOS](https://github.com/armada-os/armada)。
+应用问题请在本仓库的 [Issues](https://github.com/ArmadaOS-Freedom/smart-tf-allocator/issues) 反馈；Linux 游戏库配置请查看 [Armada Installer](https://github.com/mydanyi/armada-installer)；系统镜像及设备支持请查看 [ArmadaOS](https://github.com/armada-os/armada)。
 
 - [单翼制作 · 哔哩哔哩](https://space.bilibili.com/258786)
 - [爱发电支持](https://afdian.com/a/meetmiku)

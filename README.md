@@ -6,7 +6,7 @@ English | [简体中文](README.zh-CN.md)
 
 Split a microSD card between Android app storage and a Linux game library with a single slider. Smart TF Card Allocator (智能TF卡分配器) is the Android companion to [Armada Installer](https://github.com/mydanyi/armada-installer) for handhelds running Android and ArmadaOS.
 
-[Download APK](https://github.com/mydanyi/smart-tf-allocator/releases/latest) · [Armada Installer](https://github.com/mydanyi/armada-installer) · [Report an issue](https://github.com/mydanyi/smart-tf-allocator/issues)
+[Download APK](https://github.com/ArmadaOS-Freedom/smart-tf-allocator/releases/latest) · [Armada Installer](https://github.com/mydanyi/armada-installer) · [Report an issue](https://github.com/ArmadaOS-Freedom/smart-tf-allocator/issues)
 
 ![Smart TF Card Allocator running on an AYN Odin 3](docs/screenshot-zh-CN.png)
 
@@ -16,6 +16,8 @@ Split a microSD card between Android app storage and a Linux game library with a
 
 - Choose how much space goes to Android and Linux, with a live capacity estimate. The middle of the slider (an Android share of 10%–90%) creates a mixed card; either end gives the whole card to a single system.
 - Set up Android adopted storage for supported apps and their data, including a card that is entirely Android storage.
+- Move supported user apps between internal storage and the Android part of the card, and move primary shared storage where supported. Moved apps stay in the list; system and factory-preinstalled apps are excluded.
+- Review already allocated space separately from the reallocation controls. Landscape logs open below the main panels, with author links and the version on one compact footer row.
 - Prepare a companion partition that Armada Installer can recognize and format as a Linux game library, or hand the whole card to Linux.
 - Use Shizuku on an unrooted device, or start Shizuku with root on a rooted device.
 - Work on non-root firmware that blocks reading the card's hardware CID: the app identifies the card by its volume instead, so no root or security setting is needed. A Linux share created this way needs Armada Installer 0.5.0 or later; cards with a readable CID keep the existing flow.
@@ -34,7 +36,7 @@ This app does not install ArmadaOS. For system images and device support, see th
 
 ## How to use
 
-1. Back up the TF card, then install the APK from [Releases](https://github.com/mydanyi/smart-tf-allocator/releases/latest).
+1. Back up the TF card, then install the APK from [Releases](https://github.com/ArmadaOS-Freedom/smart-tf-allocator/releases/latest).
 2. Start Shizuku and authorize Smart TF Card Allocator. On Android 11 or later, wireless debugging lets you start Shizuku on the device without root. For other startup methods, follow the [official Shizuku guide](https://shizuku.rikka.app/guide/setup/) and the instructions shown by your installed version. After a reboot, start Shizuku again if needed.
 3. Open the app, select the TF card and use **Rescan** if needed.
 4. Move the slider to choose the split. The ends give the whole card to one system; the 10%–90% Android range shares the card. Capacities are approximate and allow for Android storage metadata.
@@ -71,7 +73,7 @@ The Android robot is reproduced or modified from work created and shared by Goog
 
 ## Support and community
 
-For app issues, use [Issues](https://github.com/mydanyi/smart-tf-allocator/issues). For Linux game-library setup, see [Armada Installer](https://github.com/mydanyi/armada-installer). For system images and device support, see [ArmadaOS](https://github.com/armada-os/armada).
+For app issues, use [Issues](https://github.com/ArmadaOS-Freedom/smart-tf-allocator/issues). For Linux game-library setup, see [Armada Installer](https://github.com/mydanyi/armada-installer). For system images and device support, see [ArmadaOS](https://github.com/armada-os/armada).
 
 - Made by [单翼](https://space.bilibili.com/258786)
 - [Support development](https://afdian.com/a/meetmiku)
