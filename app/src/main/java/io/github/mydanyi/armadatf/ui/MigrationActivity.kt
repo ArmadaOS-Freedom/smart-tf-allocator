@@ -208,7 +208,11 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         }
         if (error == null) return
         val h = handle ?: return
-        if (h.state != STATE_STARTING && h.state != ShizukuManager.MIGRATION_RUNNING) return
+        // Every unresolved request — a `starting` one whose start answer was
+        // lost as well as a persisted `unverified` one — is handled here, so a
+        // destination_unverified answer still reaches the saved destination
+        // check instead of being dropped.
+        if (!h.isUnresolved) return
         when {
             error.code == ERR_DESTINATION_UNVERIFIED -> verifySavedDestination()
             error.code == ERR_NOT_READY -> {
@@ -259,7 +263,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     private fun applyOverview(info: ShizukuManager.MigrationOverview) {
         overview = info
         val saved = handle
-        if (saved != null && saved.diskId == info.diskId && isRecoverable(saved)) {
+        if (saved != null && saved.diskId == info.diskId && saved.isUnresolved) {
             // Only a retained record that describes this exact request may
             // decide the outcome; a fast completion before the relaunch is
             // verified from the destination, never restarted.
@@ -307,12 +311,6 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         resumeSavedPolling()
         render()
     }
-
-    /** States whose outcome a fresh overview may still resolve. */
-    private fun isRecoverable(handle: MigrationHandle): Boolean =
-        handle.state == STATE_STARTING ||
-            handle.state == ShizukuManager.MIGRATION_RUNNING ||
-            handle.state == STATE_UNVERIFIED
 
     /**
      * No retained record describes this request: never repeat the start and
@@ -557,6 +555,19 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
 
     private fun startConfirmed(prepared: ShizukuManager.PreparedMigration) {
         if (starting || lastStartedToken == prepared.token) return
+        // Final gate: preparePrimary/prepareApp only prove the state at the
+        // moment the confirmation dialog opened. Another Activity or a callback
+        // may have persisted a newer unresolved handle since then, so the
+        // shared predicate is re-read immediately before the save and the
+        // native start.
+        if (migrationEntryBlocked()) {
+            pendingPrepared = null
+            terminalText = migrationErrorText(ERR_BUSY)
+            terminalColor = R.color.color_warning
+            pushLog(LEVEL_WARN, ERR_BUSY, null)
+            render()
+            return
+        }
         lastStartedToken = prepared.token
         pendingPrepared = null
         starting = true
@@ -879,8 +890,18 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     }
 
     private fun isBusy(): Boolean = manager.currentState() != ShizukuManager.State.READY ||
-        starting || preparing || handle?.state == STATE_STARTING ||
-        handle?.state == ShizukuManager.MIGRATION_RUNNING || manager.migrationActive
+        starting || preparing || handle?.isUnresolved == true ||
+        manager.hasUnresolvedMigration() || manager.migrationActive
+
+    /**
+     * Shared unresolved-entry predicate. The persisted handle is re-read on
+     * every call, so a request saved by another Activity/callback closes the
+     * gate even when this instance never observed that start.
+     */
+    private fun migrationEntryBlocked(): Boolean =
+        handle?.isUnresolved == true ||
+            manager.hasUnresolvedMigration() ||
+            manager.currentState() != ShizukuManager.State.READY
 
     private fun setStateText(resId: Int, colorRes: Int) {
         setStateText(getString(resId), colorRes)
@@ -1121,6 +1142,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         const val STATE_STARTING = "starting"
         const val STATE_UNVERIFIED = "unverified"
         const val ERR_NOT_READY = "service_not_ready"
+        const val ERR_BUSY = "busy"
         const val ERR_DESTINATION_UNVERIFIED = "destination_unverified"
         const val LEVEL_INFO = "INFO"
         const val LEVEL_WARN = "WARN"

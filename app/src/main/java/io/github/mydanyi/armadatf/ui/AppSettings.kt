@@ -24,7 +24,32 @@ data class MigrationHandle(
     val privateUuid: String?,
     val state: String,
     val errorCode: String? = null,
-)
+) {
+
+    /**
+     * True while this saved request still has to be resolved before anything
+     * destructive may start: the native move is still `starting`/`running`, or
+     * its destination is `unverified`.
+     *
+     * Only a definitive native failure or an actually verified destination
+     * releases the handle, so an unrecognised or transient persisted state stays
+     * unresolved instead of unlocking formatting or a second migration.
+     */
+    val isUnresolved: Boolean
+        get() = when (state) {
+            STATE_STARTING, STATE_RUNNING, STATE_UNVERIFIED -> true
+            STATE_COMPLETED, STATE_FAILED -> false
+            else -> true
+        }
+
+    companion object {
+        const val STATE_STARTING = "starting"
+        const val STATE_RUNNING = "running"
+        const val STATE_COMPLETED = "completed"
+        const val STATE_FAILED = "failed"
+        const val STATE_UNVERIFIED = "unverified"
+    }
+}
 
 /**
  * Small persisted-settings helper for the two user preferences the screen owns:

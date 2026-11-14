@@ -19,6 +19,7 @@ import io.github.mydanyi.armadatf.domain.MigrationRequest
 import io.github.mydanyi.armadatf.domain.MoveStatus
 import io.github.mydanyi.armadatf.domain.MoveStatusDecoder
 import io.github.mydanyi.armadatf.domain.PlatformPaths
+import io.github.mydanyi.armadatf.domain.RepartitionPolicy
 import io.github.mydanyi.armadatf.domain.VolumeUuids
 import org.json.JSONArray
 import org.json.JSONObject
@@ -352,37 +353,39 @@ class StorageUserService : IStorageService.Stub() {
 
                 val appsArray = JSONArray()
                 var appsError: String? = null
-                var appsTruncated = false
-                var anyAppOnCard = false
+                var moveBackRequired: Boolean? = null
                 val cardReady = isUsablePrivateTarget(card.privateVolume)
-                if (selected != null) {
+                val privateFsUuids = volumes
+                    .filter { it.diskId == diskId && it.type == TYPE_PRIVATE }
+                    .map { it.fsUuid }
+                val identityRefusal = RepartitionPolicy.privateIdentityRefusal(privateFsUuids)
+                if (identityRefusal != null) {
+                    // Unknown private identity: neither the caller inventory nor
+                    // the all-user occupancy can be verified.
+                    appsError = identityRefusal
+                    log(LEVEL_WARN, "migration_info_apps", appsError)
+                } else if (privateFsUuids.isEmpty()) {
+                    // No adoptable private volume: nothing on the card to move back.
+                    moveBackRequired = false
+                } else {
+                    if (selected != null) {
+                        appsError = buildInventory(appsArray, userId, selected, cardReady)
+                    }
+                    // The summary spans every Android profile and includes
+                    // system apps, while the inventory above stays user-scoped.
                     try {
-                        val installed = nativeMigration.installedApps(userId)
-                            .sortedBy { it.packageName }
-                        // Visibility is decided by the pure policy alone: an
-                        // installed user app stays listed on whatever volume it
-                        // occupies, so a completed move never hides it. The
-                        // admin read stays per row below; it is not needed to
-                        // decide visibility.
-                        val visible = installed.filter {
-                            MigrationPolicy.visibleInInventory(
-                                it.toInstalledApp(isDeviceAdmin = null),
-                                selected,
-                            )
-                        }
-                        appsTruncated = visible.size > MAX_MIGRATION_APPS
-                        // Full detection over every installed app, so a card
-                        // that still holds any app is never reported as empty.
-                        anyAppOnCard = installed.any { onSelectedCard(it, selected) }
-                        for (snapshot in visible.take(MAX_MIGRATION_APPS)) {
-                            val app = snapshot.toInstalledApp(
-                                nativeMigration.isDeviceAdmin(snapshot.packageName, userId),
-                            )
-                            val onCard = MigrationPolicy.isOnSelectedCard(app, selected)
-                            appsArray.put(appJson(app, selected, onCard, cardReady))
-                        }
+                        val allApps = nativeMigration.installedAppsAllUsers(userId)
+                        val sources = allApps.values.asSequence()
+                            .flatten()
+                            .map { it.sourceUuid }
+                            .toList()
+                        moveBackRequired = RepartitionPolicy.occupancyRefusal(
+                            RepartitionPolicy.privateUuids(privateFsUuids),
+                            primaryRaw,
+                            sources,
+                        ) != null
                     } catch (e: Exception) {
-                        appsError = classify(e)
+                        if (appsError == null) appsError = classify(e)
                         log(LEVEL_WARN, "migration_info_apps", appsError)
                     }
                 }
@@ -405,12 +408,12 @@ class StorageUserService : IStorageService.Stub() {
                         if (appsError != null) {
                             JSONObject.NULL
                         } else {
-                            primaryOnThisDisk || anyAppOnCard
+                            moveBackRequired ?: false
                         },
                     )
                     .put("volumes", volumesArray)
                     .put("apps", appsArray)
-                    .put("apps_truncated", appsTruncated)
+                    .put("apps_truncated", false)
                 if (appsError != null) data.put("apps_error", appsError)
                 val active = migrationRecords.values.lastOrNull()
                 if (active != null) data.put("active_migration", recordJson(active))
@@ -742,13 +745,15 @@ class StorageUserService : IStorageService.Stub() {
             val record = migrationRecords[moveId]
             val decoded = MoveStatusDecoder.decode(nativeStatus)
             if (record == null) {
+                // A native terminal status releases only its own move, while an
+                // in-progress resume claims a free slot.
+                migrationActiveMoveId = MoveStatusDecoder.activeMoveIdAfter(
+                    migrationActiveMoveId,
+                    moveId,
+                    decoded,
+                )
                 return when (decoded) {
                     is MoveStatus.InProgress -> {
-                        // A resumed move has no retained request in this process,
-                        // but it is still running natively: keep its id so a new
-                        // startMigration stays blocked instead of reallocating
-                        // under the active move.
-                        if (migrationActiveMoveId == null) migrationActiveMoveId = moveId
                         ok(
                             statusJson(
                                 moveId = moveId,
@@ -1351,42 +1356,77 @@ class StorageUserService : IStorageService.Stub() {
         sizeBytes = null,
     )
 
-    private fun onSelectedCard(
-        snapshot: NativeMigration.PackageSnapshot,
-        selectedPrivateUuid: String,
-    ): Boolean = VolumeUuids.same(snapshot.sourceUuid, selectedPrivateUuid)
+    /**
+     * Fills [appsArray] with every visible application of [userId], sorted by
+     * package name. There is no length cap: a card occupant later in the
+     * alphabet must stay reachable and movable back.
+     *
+     * @return `null` on success, otherwise the stable error code to report.
+     */
+    private fun buildInventory(
+        appsArray: JSONArray,
+        userId: Int,
+        selected: String,
+        cardReady: Boolean,
+    ): String? = try {
+        val installed = nativeMigration.installedApps(userId)
+        val inventory = MigrationPolicy.inventoryApps(
+            installed.map { it.toInstalledApp(isDeviceAdmin = null) },
+            selected,
+        )
+        for (app in inventory) {
+            val row = app.copy(
+                isDeviceAdmin = nativeMigration.isDeviceAdmin(app.packageName, userId),
+            )
+            val onCard = MigrationPolicy.isOnSelectedCard(row, selected)
+            appsArray.put(appJson(row, selected, onCard, cardReady))
+        }
+        null
+    } catch (e: Exception) {
+        classify(e)
+    }
 
     /**
      * Refuses to format a card that still carries the device's primary storage
-     * or any installed application. Returns [ERR_MOVE_BACK_REQUIRED] when the
-     * card is still in use, `null` when it is safe.
+     * or an installed application of ANY Android user/profile.
+     *
+     * Private volume identities are verified first: an unreadable UUID makes
+     * occupancy unverifiable, so formatting is refused before any occupancy
+     * query. Applications are swept for every reported user and are NOT
+     * filtered like the inventory: a system app or another profile's app still
+     * protects the card. Package query failures stay refusals, never empty.
      */
     private fun moveBackBlocked(
         diskId: String,
         volumes: List<NativeStorage.VolumeSnapshot>,
         userId: Int,
     ): String? {
-        val privateVolumes = volumes.filter { it.diskId == diskId && it.type == TYPE_PRIVATE }
-        if (privateVolumes.isEmpty()) return null
-        val privateUuids = privateVolumes.mapNotNull { Identifiers.normalizeUuid(it.fsUuid) }.toSet()
+        val privateFsUuids = volumes
+            .filter { it.diskId == diskId && it.type == TYPE_PRIVATE }
+            .map { it.fsUuid }
+        RepartitionPolicy.privateIdentityRefusal(privateFsUuids)?.let { code ->
+            throw MigrationRejectedException(
+                code,
+                "the card's private volume identifiers could not be verified",
+            )
+        }
+        val privateUuids = RepartitionPolicy.privateUuids(privateFsUuids)
         if (privateUuids.isEmpty()) return null
-        val primary = Identifiers.normalizeUuid(nativeMigration.primaryStorageUuid(userId))
-        if (primary != null && primary in privateUuids) return ERR_MOVE_BACK_REQUIRED
-        val apps = try {
-            nativeMigration.installedApps(userId)
+        val primary = nativeMigration.primaryStorageUuid(userId)
+        RepartitionPolicy.occupancyRefusal(privateUuids, primary, emptyList())
+            ?.let { return it }
+        val allApps = try {
+            nativeMigration.installedAppsAllUsers(userId)
         } catch (e: SecurityException) {
             throw e
         } catch (e: Exception) {
             throw MigrationRejectedException(
                 MigrationErrors.APP_QUERY_UNAVAILABLE,
-                "installed applications could not be read",
+                "installed applications could not be read for every Android user",
             )
         }
-        val onCard = apps.any { snapshot ->
-            val source = Identifiers.normalizeUuid(snapshot.sourceUuid)
-            source != null && source in privateUuids
-        }
-        return if (onCard) ERR_MOVE_BACK_REQUIRED else null
+        val sources = allApps.values.asSequence().flatten().map { it.sourceUuid }.toList()
+        return RepartitionPolicy.occupancyRefusal(privateUuids, primary, sources)
     }
 
     /**
@@ -1504,8 +1544,6 @@ class StorageUserService : IStorageService.Stub() {
         const val ERR_INTERRUPTED = "verification_interrupted"
         const val ERR_INTERNAL = "internal_error"
 
-        /** Partition refused because the card still holds primary storage/apps. */
-        const val ERR_MOVE_BACK_REQUIRED = "move_back_required"
         const val ERR_NATIVE_MIGRATION_UNAVAILABLE = "native_migration_unavailable"
         const val ERR_NO_MIGRATION_PLAN = "no_migration_plan"
         const val ERR_MOVE_START_FAILED = "move_start_failed"
@@ -1533,7 +1571,6 @@ class StorageUserService : IStorageService.Stub() {
         const val STATE_BAD_REMOVAL = 7
         const val STATE_REMOVED = 8
 
-        const val MAX_MIGRATION_APPS = 300
         const val MAX_RETAINED_MOVES = 8
 
         const val ERASE_SCOPE = "entire_tf_card"

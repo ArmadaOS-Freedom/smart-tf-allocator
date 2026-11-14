@@ -112,16 +112,149 @@ class NativeMigration(
      * cannot be read.
      */
     fun installedApps(userId: Int): List<PackageSnapshot> = privileged {
+        installedAppsIn(userId, factoryCatalog.packages())
+    }
+
+    /**
+     * Installed applications for every reported Android user/profile, using a
+     * single factory-catalog read.
+     *
+     * The platform's `IUserManager.getUsers` is privileged metadata: a denied,
+     * empty or malformed list is rejected instead of quietly narrowing the
+     * sweep to the owner. [callerUserId] must be present in the list, so a
+     * platform quirk can never hide the caller's own occupancy. Package query
+     * failures propagate; they are never treated as an empty result.
+     */
+    fun installedAppsAllUsers(callerUserId: Int): Map<Int, List<PackageSnapshot>> =
+        privileged {
+            val users = userIdsIn()
+            val factoryPackages = factoryCatalog.packages()
+            allUsersPackages(users, callerUserId) { installedAppsIn(it, factoryPackages) }
+        }
+
+    /**
+     * Enumerates every reported user once and keeps each user's packages.
+     *
+     * The calling user must be part of [users] (see [requireUserList]); any
+     * failure raised by [readUserApps] propagates and aborts the whole sweep.
+     * There is no fallback to the calling user, because a partial result cannot
+     * describe global occupancy. The read is injected so this orchestration
+     * stays host-testable without binder or Android stubs.
+     */
+    internal fun allUsersPackages(
+        users: List<Int>,
+        callerUserId: Int,
+        readUserApps: (Int) -> List<PackageSnapshot>,
+    ): Map<Int, List<PackageSnapshot>> =
+        requireUserList(users, callerUserId).associateWith(readUserApps)
+
+    private fun installedAppsIn(
+        userId: Int,
+        factoryPackages: Set<String>,
+    ): List<PackageSnapshot> {
         val manager = systemService(SERVICE_PACKAGE, PACKAGE_INTERFACE)
         val method = installedApplicationsMethod()
             ?: throw NativeMigrationException(
                 "IPackageManager.getInstalledApplications is not available",
             )
         val slice = invoke(method, manager, flagsArgument(method, 0), userId)
-        val factoryPackages = factoryCatalog.packages()
-        parceledList(slice).mapNotNull { info ->
-            info?.let { toPackageSnapshot(it, factoryPackages) }
+        return applicationEntries(parceledList(slice)).map { info ->
+            toPackageSnapshot(info, factoryPackages)
         }
+    }
+
+    /**
+     * Validates one unwrapped `getInstalledApplications` result.
+     *
+     * A missing slice or list, or a `null` application entry, is unusable
+     * package metadata: the sweep is refused instead of dropping what could not
+     * be read, because a silently partial list understates global occupancy. A
+     * genuine, non-null empty list is a valid answer and is kept as such.
+     * Visible for the host-side list-validation test.
+     */
+    internal fun applicationEntries(entries: List<*>?): List<Any> {
+        val list = entries
+            ?: throw NativeMigrationException(
+                "IPackageManager.getInstalledApplications returned no application list",
+            )
+        return list.map { info ->
+            info ?: throw NativeMigrationException(
+                "IPackageManager.getInstalledApplications returned a null application",
+            )
+        }
+    }
+
+    // --- Android users -------------------------------------------------------
+
+    private fun userIdsIn(): List<Int> {
+        val manager = systemService(SERVICE_USER, USER_INTERFACE)
+        val method = usersMethod()
+            ?: throw NativeMigrationException("IUserManager.getUsers is not available")
+        val users = invoke(method, manager, *userQueryArgs(method.parameterCount)) as? List<*>
+        return userIdsFromList(users)
+    }
+
+    /**
+     * Arguments for a supported `getUsers` arity. Every flag selects the
+     * inclusive form, so partial, dying and pre-created users are all returned.
+     * Visible for the host-side signature test.
+     */
+    internal fun userQueryArgs(parameterCount: Int): Array<Any?> = when (parameterCount) {
+        1, 2, 3 -> Array<Any?>(parameterCount) { false }
+        else -> throw NativeMigrationException(
+            "IUserManager.getUsers has unsupported arity $parameterCount",
+        )
+    }
+
+    /**
+     * Validates the `List<UserInfo>` returned by `getUsers`.
+     *
+     * An empty or null list is unusable metadata, not "no profiles": Android
+     * always has at least the owner. A null entry, a missing/non-numeric `id`
+     * or a negative id is rejected. Visible for the host-side mapping test.
+     */
+    internal fun userIdsFromList(users: List<*>?): List<Int> {
+        if (users.isNullOrEmpty()) {
+            throw NativeMigrationException("IUserManager.getUsers returned no users")
+        }
+        return users.map { user ->
+            val info = user
+                ?: throw NativeMigrationException("IUserManager.getUsers returned a null user")
+            val id = optionalIntField(info, "id")
+                ?: throw NativeMigrationException(
+                    "id of ${info.javaClass.name} was not numeric",
+                )
+            if (id < 0) {
+                throw NativeMigrationException("IUserManager.getUsers returned an invalid id")
+            }
+            id
+        }.distinct()
+    }
+
+    /**
+     * Requires the calling user to be part of the platform's user list; a list
+     * that omits the caller cannot describe global occupancy. Visible for the
+     * host-side rejection test.
+     */
+    internal fun requireUserList(users: List<Int>, callerUserId: Int): List<Int> {
+        if (callerUserId !in users) {
+            throw NativeMigrationException(
+                "IUserManager.getUsers did not report the calling user $callerUserId",
+            )
+        }
+        return users
+    }
+
+    private fun usersMethod(): Method? {
+        val candidates = classFor(USER_INTERFACE).methods.filter { method ->
+            method.name == "getUsers" &&
+                method.parameterCount in 1..3 &&
+                method.parameterTypes.all { it == Boolean::class.javaPrimitiveType }
+        }
+        // Android 15 has three booleans; older releases expose one or two.
+        return candidates.firstOrNull { it.parameterCount == 3 }
+            ?: candidates.firstOrNull { it.parameterCount == 2 }
+            ?: candidates.firstOrNull { it.parameterCount == 1 }
     }
 
     /** One package, or `null` when it is not installed for [userId]. */
@@ -380,8 +513,9 @@ class NativeMigration(
     private fun flagsArgument(method: Method, index: Int): Any =
         if (method.parameterTypes[index] == Long::class.javaPrimitiveType) 0L else 0
 
-    private fun parceledList(slice: Any?): List<*> {
-        if (slice == null) return emptyList<Any?>()
+    /** Unwraps the returned slice; `null` means the platform returned none. */
+    private fun parceledList(slice: Any?): List<*>? {
+        if (slice == null) return null
         val getList = try {
             Class.forName("android.content.pm.ParceledListSlice").getMethod("getList")
         } catch (e: ReflectiveOperationException) {
@@ -432,9 +566,11 @@ class NativeMigration(
     private companion object {
         const val SERVICE_MOUNT = "mount"
         const val SERVICE_PACKAGE = "package"
+        const val SERVICE_USER = "user"
 
         const val STORAGE_INTERFACE = "android.os.storage.IStorageManager"
         const val PACKAGE_INTERFACE = "android.content.pm.IPackageManager"
+        const val USER_INTERFACE = "android.os.IUserManager"
 
         const val EXPAND_MARKER = "/mnt/expand/"
 

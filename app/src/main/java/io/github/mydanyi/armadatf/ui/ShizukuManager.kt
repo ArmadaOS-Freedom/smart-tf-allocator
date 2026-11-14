@@ -467,6 +467,9 @@ class ShizukuManager private constructor(private val appContext: Context) {
     fun prepare(diskId: String, androidPercent: Int, callback: (Prepared?, IpcError?) -> Unit) {
         val linuxPercent = 100 - androidPercent
         withService(callback) { service ->
+            if (hasUnresolvedMigration()) {
+                return@withService null to IpcError(ERR_BUSY, null)
+            }
             val json = JSONObject(service.prepare(diskId, linuxPercent))
             if (!json.optBoolean("ok", false)) {
                 return@withService null to errorOf(json)
@@ -487,6 +490,9 @@ class ShizukuManager private constructor(private val appContext: Context) {
 
     fun start(token: String, callback: (OperationStatus?, IpcError?) -> Unit) {
         withService(callback) { service ->
+            if (hasUnresolvedMigration()) {
+                return@withService null to IpcError(ERR_BUSY, null)
+            }
             val json = JSONObject(service.start(token, true))
             if (!json.optBoolean("ok", false)) {
                 return@withService null to errorOf(json)
@@ -541,6 +547,9 @@ class ShizukuManager private constructor(private val appContext: Context) {
         callback: (PreparedMigration?, IpcError?) -> Unit,
     ) {
         withService(callback) { service ->
+            if (hasUnresolvedMigration()) {
+                return@withService null to IpcError(ERR_BUSY, null)
+            }
             val json = JSONObject(service.prepareMigration(request.toJson().toString()))
             if (!json.optBoolean("ok", false)) {
                 return@withService null to errorOf(json)
@@ -620,6 +629,18 @@ class ShizukuManager private constructor(private val appContext: Context) {
         stopMigrationPolling()
         setMigrationActive(false)
     }
+
+    /**
+     * True while a durable migration handle still has to be resolved.
+     *
+     * Read-only: refresh, status and recovery stay available. Queued IPC work
+     * consults it inside the executor lambda, so a call queued before a handle
+     * was persisted still sees the current gate instead of bypassing the
+     * disabled UI after a restart. `startMigration` deliberately does not use
+     * it: its own `starting` handle is persisted before its IPC by design.
+     */
+    fun hasUnresolvedMigration(): Boolean =
+        AppSettings.migrationHandle(appContext)?.isUnresolved == true
 
     /** App-scoped migration polling; terminal/unavailable answers stop it. */
     fun startMigrationPolling(moveId: Int) {
@@ -958,6 +979,7 @@ class ShizukuManager private constructor(private val appContext: Context) {
         private const val STATE_RUNNING = "running"
         private const val POLL_INTERVAL_MS = 1_000L
         private const val ERR_NOT_READY = "service_not_ready"
+        private const val ERR_BUSY = "busy"
         private const val ERR_INTERNAL = "internal_error"
 
         fun get(context: Context): ShizukuManager {

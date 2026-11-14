@@ -21,6 +21,8 @@ object MigrationErrors {
     const val PACKAGE_NOT_ELIGIBLE = "package_not_eligible"
     const val PROTECTED_PACKAGE = "protected_package"
     const val APP_QUERY_UNAVAILABLE = "app_query_unavailable"
+    /** The card still holds primary storage or an application of any user. */
+    const val MOVE_BACK_REQUIRED = "move_back_required"
 }
 
 /**
@@ -207,6 +209,18 @@ object MigrationPolicy {
         if (isProtectedPackage(app.packageName)) return false
         return !isFactoryApp(app)
     }
+
+    /**
+     * The full, uncapped inventory for one user: every visible application,
+     * sorted by package name. No row is dropped, so a card occupant that sorts
+     * after hundreds of other packages stays reachable and movable back.
+     */
+    fun inventoryApps(
+        apps: List<InstalledApp>,
+        selectedPrivateUuid: String?,
+    ): List<InstalledApp> = apps
+        .filter { visibleInInventory(it, selectedPrivateUuid) }
+        .sortedBy { it.packageName }
 
     /** True when [app] currently lives on the selected adopted card. */
     fun isOnSelectedCard(app: InstalledApp, selectedPrivateUuid: String?): Boolean {
