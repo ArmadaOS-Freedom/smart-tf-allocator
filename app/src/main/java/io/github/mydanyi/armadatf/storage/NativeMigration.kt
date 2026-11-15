@@ -129,7 +129,9 @@ class NativeMigration(
         privileged {
             val users = userIdsIn()
             val factoryPackages = factoryCatalog.packages()
-            allUsersPackages(users, callerUserId) { installedAppsIn(it, factoryPackages) }
+            allUsersPackages(users, callerUserId) { userId, flags ->
+                installedAppsIn(userId, factoryPackages, flags)
+            }
         }
 
     /**
@@ -144,21 +146,30 @@ class NativeMigration(
     internal fun allUsersPackages(
         users: List<Int>,
         callerUserId: Int,
-        readUserApps: (Int) -> List<PackageSnapshot>,
+        readUserApps: (Int, Long) -> List<PackageSnapshot>,
     ): Map<Int, List<PackageSnapshot>> =
-        requireUserList(users, callerUserId).associateWith(readUserApps)
+        requireUserList(users, callerUserId).associateWith { userId ->
+            readUserApps(userId, MATCH_UNINSTALLED_PACKAGES)
+        }
 
     private fun installedAppsIn(
         userId: Int,
         factoryPackages: Set<String>,
+        flags: Long = 0L,
     ): List<PackageSnapshot> {
         val manager = systemService(SERVICE_PACKAGE, PACKAGE_INTERFACE)
         val method = installedApplicationsMethod()
             ?: throw NativeMigrationException(
                 "IPackageManager.getInstalledApplications is not available",
             )
-        val slice = invoke(method, manager, flagsArgument(method, 0), userId)
-        return applicationEntries(parceledList(slice)).map { info ->
+        val slice = invoke(method, manager, flagsArgument(method, 0, flags), userId)
+        val entries = parceledList(slice)
+        val validated = if ((flags and MATCH_UNINSTALLED_PACKAGES) != 0L) {
+            occupancyApplicationEntries(entries)
+        } else {
+            applicationEntries(entries)
+        }
+        return validated.map { info ->
             toPackageSnapshot(info, factoryPackages)
         }
     }
@@ -181,6 +192,27 @@ class NativeMigration(
             info ?: throw NativeMigrationException(
                 "IPackageManager.getInstalledApplications returned a null application",
             )
+        }
+    }
+
+    /**
+     * Validates a broad `MATCH_UNINSTALLED_PACKAGES` result for occupancy.
+     *
+     * The broad query also returns uninstalled-but-retained records and hidden
+     * apps; only entries whose `ApplicationInfo.FLAG_INSTALLED` bit is set are
+     * installed for this user and kept. A null entry, or an entry whose flags
+     * cannot be read as a number, refuses the sweep: a silently partial list
+     * would understate occupancy and the destructive format guard could miss
+     * installed data. Visible for the host-side occupancy test.
+     */
+    internal fun occupancyApplicationEntries(entries: List<*>?): List<Any> {
+        val list = applicationEntries(entries)
+        return list.mapNotNull { info ->
+            val flags = optionalIntField(info, "flags")
+                ?: throw NativeMigrationException(
+                    "flags of ${info.javaClass.name} was not numeric",
+                )
+            info.takeIf { (flags and FLAG_INSTALLED) != 0 }
         }
     }
 
@@ -510,8 +542,8 @@ class NativeMigration(
         }
     }
 
-    private fun flagsArgument(method: Method, index: Int): Any =
-        if (method.parameterTypes[index] == Long::class.javaPrimitiveType) 0L else 0
+    private fun flagsArgument(method: Method, index: Int, flags: Long = 0L): Any =
+        if (method.parameterTypes[index] == Long::class.javaPrimitiveType) flags else flags.toInt()
 
     /** Unwraps the returned slice; `null` means the platform returned none. */
     private fun parceledList(slice: Any?): List<*>? {
@@ -579,6 +611,12 @@ class NativeMigration(
 
         /** `ApplicationInfo.FLAG_UPDATED_SYSTEM_APP`. */
         const val FLAG_UPDATED_SYSTEM_APP = 1 shl 7
+
+        /** `ApplicationInfo.FLAG_INSTALLED`. */
+        const val FLAG_INSTALLED = 1 shl 23
+
+        /** `PackageManager.MATCH_UNINSTALLED_PACKAGES`. */
+        const val MATCH_UNINSTALLED_PACKAGES = 0x2000L
 
         /** `PackageManager.INSTALL_LOCATION_UNSPECIFIED`. */
         const val INSTALL_LOCATION_UNSPECIFIED = -1

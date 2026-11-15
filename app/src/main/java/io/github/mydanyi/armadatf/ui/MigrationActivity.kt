@@ -196,6 +196,10 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         status: ShizukuManager.MigrationStatus?,
         error: ShizukuManager.IpcError?,
     ) {
+        // An id from a previous kernel boot is not authoritative: that native
+        // task ended with the reboot, so its answer is skipped until the
+        // destination itself has been verified.
+        if (handle?.hasRebooted(AppSettings.currentBootId()) == true) return
         if (status != null) {
             val expected = currentMoveId ?: handle?.moveId
             if (expected != null && status.moveId != expected) return
@@ -213,20 +217,19 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         // destination_unverified answer still reaches the saved destination
         // check instead of being dropped.
         if (!h.isUnresolved) return
-        when {
-            error.code == ERR_DESTINATION_UNVERIFIED -> verifySavedDestination()
-            error.code == ERR_NOT_READY -> {
+        when (MigrationPollErrorPolicy.actionFor(error.code)) {
+            MigrationPollErrorAction.VERIFY_DESTINATION -> verifySavedDestination()
+            MigrationPollErrorAction.WAIT_FOR_CONNECTION -> {
                 setStateText(R.string.migration_state_not_ready, R.color.color_warning)
                 render()
             }
-            // A transport/permission/read failure says nothing about the native
-            // move: keep the saved handle and present it as unverified instead
-            // of claiming a native failure or dropping the busy state.
-            error.code in TRANSIENT_ERRORS -> {
+            // Every other call failure says nothing about the native move: keep
+            // the saved handle and present it as unverified instead of claiming
+            // a native failure or dropping the busy state.
+            MigrationPollErrorAction.KEEP_UNVERIFIED -> {
                 pushLog(LEVEL_WARN, error.code, error.detail)
                 markUnverified(cardChanged = false)
             }
-            else -> markFailed(error.code)
         }
     }
 
@@ -263,13 +266,19 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     private fun applyOverview(info: ShizukuManager.MigrationOverview) {
         overview = info
         val saved = handle
-        if (saved != null && saved.diskId == info.diskId && saved.isUnresolved) {
+        if (saved != null && saved.diskId == info.diskId && saved.isUnresolved &&
+            saved.hasRebooted(AppSettings.currentBootId())
+        ) {
+            // A confirmed kernel reboot ended any old native task: its id is
+            // never adopted or polled again, the actual card is verified.
+            recoverAfterReboot()
+        } else if (saved != null && saved.diskId == info.diskId && saved.isUnresolved) {
             // Only a retained record that describes this exact request may
             // decide the outcome; a fast completion before the relaunch is
             // verified from the destination, never restarted.
             val active = info.activeMigration?.takeIf { it.moveId > 0 && activeMatches(saved, it) }
             when {
-                active == null -> keepUnresolved(saved)
+                active == null -> recoverWithoutRetainedMove(saved)
                 !cardMatches(saved, info) -> if (saved.state != STATE_UNVERIFIED) {
                     markUnverified(cardChanged = true)
                 }
@@ -302,6 +311,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
                     packageName = active.packageName,
                     sourceUuid = "",
                     privateUuid = info.selectedPrivateUuid,
+                    bootId = AppSettings.currentBootId(),
                     state = ShizukuManager.MIGRATION_RUNNING,
                 )
                 adoptHandle(restored)
@@ -331,9 +341,53 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         }
     }
 
+    /**
+     * Confirmed reboot recovery: the old native task ended with the previous
+     * kernel boot, so its id is neither polled nor trusted. The actual card is
+     * verified instead, and a request still at its original source is released
+     * as interrupted rather than locked forever.
+     */
+    private fun recoverAfterReboot() {
+        currentMoveId = null
+        lastProgress = null
+        starting = false
+        setKeepScreenOn(false)
+        verifySavedDestination(rebootRecovery = true)
+    }
+
+    /**
+     * No retained service record describes this request in the current boot.
+     * It stays unresolved: a fresh destination match alone cannot prove what
+     * the old task did within the same kernel boot, so the user is asked to
+     * restart Android and refresh. A legacy handle without a boot id first
+     * stores the current one as a conservative baseline instead of guessing.
+     */
+    private fun recoverWithoutRetainedMove(saved: MigrationHandle) {
+        keepUnresolved(saved)
+        val current = handle ?: return
+        if (current.bootId == null) {
+            // Legacy handle with no baseline: record the current boot id so a
+            // later launch can prove a real restart. Nothing is verified yet.
+            AppSettings.currentBootId()?.let { live ->
+                handle = current.copy(bootId = live)
+                AppSettings.setMigrationHandle(this, handle)
+                pushLog(LEVEL_INFO, "migration_boot_baseline", null)
+            }
+        }
+        if (current.moveId != null) return
+        // Same boot and no retained record: never verify the destination alone.
+        terminalText = getString(R.string.migration_status_recovery_reboot)
+        terminalColor = R.color.color_warning
+        setKeepScreenOn(false)
+        render()
+    }
+
     private fun resumeSavedPolling() {
         val h = handle ?: return
         if (h.diskId != diskId) return
+        // An id from a previous kernel boot is not resumable: that task ended
+        // with the reboot, so polling it again would adopt a stale answer.
+        if (h.hasRebooted(AppSettings.currentBootId())) return
         if (h.moveId != null &&
             (h.state == ShizukuManager.MIGRATION_RUNNING || h.state == STATE_UNVERIFIED)
         ) {
@@ -360,6 +414,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
                 packageName = status.packageName,
                 sourceUuid = "",
                 privateUuid = info.selectedPrivateUuid,
+                bootId = AppSettings.currentBootId(),
                 state = ShizukuManager.MIGRATION_RUNNING,
             )
             adoptHandle(restored)
@@ -378,8 +433,9 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         val h = handle ?: return
         handle = h.copy(state = ShizukuManager.MIGRATION_FAILED, errorCode = code)
         AppSettings.setMigrationHandle(this, handle)
-        // Only a native terminal failure reaches this path, so the busy state
-        // may be released here.
+        // A native terminal failure and a reboot-confirmed interrupted move both
+        // reach this path: no native task is still running in either case, so
+        // the busy state may be released. A destination-only guess never does.
         manager.markMigrationIdle()
         lastProgress = null
         terminalText = null
@@ -411,10 +467,18 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         }
     }
 
-    private fun verifySavedDestination() {
+    private fun verifySavedDestination(rebootRecovery: Boolean = false) {
         val h = handle ?: return
+        // The reboot proof is re-read here from the live kernel id, so no caller
+        // can release a source match without a confirmed new boot.
+        val rebooted = rebootRecovery && h.hasRebooted(AppSettings.currentBootId())
+        if (rebootRecovery && !rebooted) return
         setStateText(R.string.migration_status_checking, R.color.color_muted)
         manager.requestMigrationOverview(h.diskId) { info, error ->
+            // This answer may arrive after another callback or Activity saved a
+            // newer migration. Only the exact request captured above may be
+            // settled, so a late result can neither clear nor replace it.
+            if (!savedRequestStillCurrent(h)) return@requestMigrationOverview
             if (info == null || error != null) {
                 markUnverified(cardChanged = false)
                 return@requestMigrationOverview
@@ -424,15 +488,20 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
                 markUnverified(cardChanged = true)
                 return@requestMigrationOverview
             }
-            val verified = if (h.kind == ShizukuManager.KIND_PRIMARY) {
-                destinationMatches(info.primaryUuid, h.targetUuid)
+            val actual = if (h.kind == ShizukuManager.KIND_PRIMARY) {
+                info.primaryUuid
             } else {
-                val pkg = h.packageName
-                val storage = pkg?.let { appStorageUuid(it) }
-                storage != null && destinationMatches(storage, h.targetUuid)
+                h.packageName?.let { appStorageUuid(it) }
             }
-            if (verified) {
+            if (destinationMatches(actual, h.targetUuid)) {
                 markCompletedVerified()
+            } else if (rebooted && h.sourceUuid.isNotBlank() &&
+                actual != null && destinationMatches(actual, h.sourceUuid)
+            ) {
+                // The reboot ended the old move and the location is still the
+                // original source, so the request is closed as interrupted
+                // instead of blocking entry forever. Normal callers never here.
+                markFailed("migration_interrupted")
             } else {
                 markUnverified(cardChanged = false)
             }
@@ -581,6 +650,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
             packageName = prepared.packageName,
             sourceUuid = prepared.sourceUuid,
             privateUuid = prepared.selectedPrivateUuid ?: overview?.selectedPrivateUuid,
+            bootId = AppSettings.currentBootId(),
             state = STATE_STARTING,
         )
         handle = saved
@@ -939,6 +1009,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         "failed_native" -> getString(R.string.migration_err_failed_native)
         "destination_mismatch" -> getString(R.string.migration_err_destination_mismatch)
         "destination_unverified" -> getString(R.string.migration_status_unverified)
+        "migration_interrupted" -> getString(R.string.migration_status_interrupted)
         "source_changed" -> getString(R.string.migration_err_source_changed)
         "target_not_mounted", "target_missing" -> getString(R.string.migration_err_target_not_mounted)
         "card_ineligible", "card_layout_unsupported", "card_changed", "card_missing" ->
@@ -1035,11 +1106,12 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         return uuidEquals(handle.targetUuid, target) || destinationMatches(target, handle.targetUuid)
     }
 
-    private fun destinationMatches(actual: String?, expected: String): Boolean {
-        if (isInternalUuid(expected)) return isInternalUuid(actual)
-        if (actual.isNullOrBlank()) return false
-        return uuidEquals(actual, expected)
-    }
+    /** True while [captured] is still both the visible and the persisted request. */
+    private fun savedRequestStillCurrent(captured: MigrationHandle): Boolean =
+        handle == captured && AppSettings.migrationHandle(this) == captured
+
+    private fun destinationMatches(actual: String?, expected: String): Boolean =
+        migrationLocationMatches(actual, expected)
 
     /**
      * Actual destination identity of [packageName] for a saved app move: the
@@ -1148,12 +1220,6 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         const val LEVEL_WARN = "WARN"
         const val LEVEL_ERROR = "ERROR"
         const val MAX_LOG_LINES = 200
-
-        /** Errors that only report a failed call, not a failed native move. */
-        val TRANSIENT_ERRORS = setOf(
-            "internal_error",
-            "permission_denied",
-        )
 
         /** Errors known to have stopped before any native move was issued. */
         val PRE_START_ERRORS = setOf(

@@ -4,7 +4,9 @@ import android.content.Context
 import android.content.res.Configuration
 import android.os.Build
 import org.json.JSONObject
+import java.io.File
 import java.util.Locale
+import java.util.UUID
 
 /**
  * Durable handle of one started migration: the retained move id plus the exact
@@ -13,6 +15,10 @@ import java.util.Locale
  *
  * The disk id and selected private UUID are stored next to the request so a
  * swapped or missing card can never inherit an old result.
+ *
+ * [bootId] is the optional kernel boot id captured when the request was
+ * persisted. It is the only admissible proof that a later launch runs on a
+ * different kernel boot; a missing value never proves one.
  */
 data class MigrationHandle(
     val moveId: Int?,
@@ -24,6 +30,7 @@ data class MigrationHandle(
     val privateUuid: String?,
     val state: String,
     val errorCode: String? = null,
+    val bootId: String? = null,
 ) {
 
     /**
@@ -42,12 +49,52 @@ data class MigrationHandle(
             else -> true
         }
 
+    /**
+     * True only when this handle is still one a restart may settle (`starting`,
+     * `running` or `unverified`) and the kernel boot id saved for it differs
+     * from [currentBootId]. Both sides must be valid canonical UUIDs, so a
+     * missing, unreadable or malformed id never proves a reboot.
+     *
+     * A full reboot definitively ended any old native task, so a retained move
+     * id does not override this: framework move ids restart and may be reused
+     * after boot. Terminal or unrecognised states never recover this way.
+     */
+    fun hasRebooted(currentBootId: String?): Boolean {
+        if (state !in RECOVERABLE_STATES) return false
+        val saved = canonicalBootId(bootId) ?: return false
+        val current = canonicalBootId(currentBootId) ?: return false
+        return saved != current
+    }
+
     companion object {
         const val STATE_STARTING = "starting"
         const val STATE_RUNNING = "running"
         const val STATE_COMPLETED = "completed"
         const val STATE_FAILED = "failed"
         const val STATE_UNVERIFIED = "unverified"
+
+        private val RECOVERABLE_STATES = setOf(
+            STATE_STARTING,
+            STATE_RUNNING,
+            STATE_UNVERIFIED,
+        )
+
+        /**
+         * Canonical lowercase form of [raw], or `null` unless it is a full UUID.
+         * The round-trip check rejects the shortened or padded forms that
+         * [UUID.fromString] may accept, so arbitrary text never becomes reboot
+         * proof. Pure: the caller does the file read.
+         */
+        fun canonicalBootId(raw: String?): String? {
+            val value = raw?.trim().orEmpty()
+            if (value.isEmpty()) return null
+            val parsed = try {
+                UUID.fromString(value)
+            } catch (t: IllegalArgumentException) {
+                return null
+            }
+            return parsed.toString().takeIf { it == value }
+        }
     }
 }
 
@@ -70,6 +117,7 @@ object AppSettings {
     private const val KEY_VERIFIED_PUBLIC_FS_UUID = "verified_public_fs_uuid"
     private const val KEY_VERIFIED_PUBLIC_PART_GUID = "verified_public_part_guid"
     private const val KEY_MIGRATION_HANDLE = "migration_handle"
+    private const val BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
     const val LANG_ZH = "zh"
     const val LANG_EN = "en"
@@ -169,6 +217,19 @@ object AppSettings {
         editor.apply()
     }
 
+    // --- kernel boot id ------------------------------------------------------
+
+    /**
+     * The kernel boot id of the running kernel, or `null` when this device does
+     * not expose it. A denied, missing or non-canonical value yields `null`, so
+     * no boot identity is ever invented.
+     */
+    fun currentBootId(): String? = try {
+        MigrationHandle.canonicalBootId(File(BOOT_ID_PATH).readText())
+    } catch (t: Exception) {
+        null
+    }
+
     // --- started migration handle --------------------------------------------
 
     /** The saved move handle, or `null` when no migration was ever started. */
@@ -200,6 +261,7 @@ object AppSettings {
                 errorCode = json.optString("error_code").takeIf {
                     it.isNotEmpty() && it != "null"
                 },
+                bootId = MigrationHandle.canonicalBootId(json.optString("boot_id")),
             )
         } catch (t: Exception) {
             null
@@ -221,6 +283,7 @@ object AppSettings {
             handle.packageName?.let { json.put("package_name", it) }
             handle.privateUuid?.let { json.put("private_uuid", it) }
             handle.errorCode?.let { json.put("error_code", it) }
+            MigrationHandle.canonicalBootId(handle.bootId)?.let { json.put("boot_id", it) }
             editor.putString(KEY_MIGRATION_HANDLE, json.toString())
         }
         editor.apply()
@@ -233,3 +296,32 @@ object AppSettings {
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 }
+
+/**
+ * Compares one observed storage location with the expected one for a saved
+ * migration. Missing, blank or whitespace-only values are UNKNOWN on either
+ * side, so an unreadable package or a missing volume can never verify an
+ * internal or a card destination (the old `isInternalUuid(null)` shortcut
+ * would have accepted a move that was never observed).
+ *
+ * `internal`, `primary` and `private` are the explicit markers the native
+ * Overview and appStorageUuid use for real internal storage; external volume
+ * UUIDs compare case-insensitively with hyphens ignored. Pure: no Android
+ * dependency.
+ */
+internal fun migrationLocationMatches(actual: String?, expected: String): Boolean {
+    val want = expected.trim()
+    if (want.isEmpty()) return false
+    val got = actual?.trim().orEmpty()
+    if (got.isEmpty()) return false
+    if (isInternalLocation(want)) return isInternalLocation(got)
+    return locationKey(got) == locationKey(want)
+}
+
+private fun isInternalLocation(value: String): Boolean =
+    value.equals("internal", ignoreCase = true) ||
+        value.equals("primary", ignoreCase = true) ||
+        value.equals("private", ignoreCase = true)
+
+private fun locationKey(value: String): String =
+    value.trim().lowercase(Locale.ROOT).replace("-", "")

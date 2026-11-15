@@ -1341,7 +1341,7 @@ class MainActivity : Activity(), ShizukuManager.Callback {
                         savedHandoff = null
                         handoffLatestKey = null
                     }
-                    if (!freshPass) {
+                    if (!freshPass && !handoffExecutor.isShutdown) {
                         handoffExecutor.execute {
                             recoverPendingHandoffOnce(generation, freshPass = true)
                         }
@@ -1382,6 +1382,7 @@ class MainActivity : Activity(), ShizukuManager.Callback {
         val handoff = savedHandoff ?: return
         // Never publish a payload other than the one this write was selected for.
         if (handoffKey(handoff) != payloadKey) return
+        if (handoffExecutor.isShutdown) return
         handoffWriting = true
         handoffFailedKey = null
         textStatus.text = getString(R.string.handoff_writing)
@@ -1603,9 +1604,9 @@ class MainActivity : Activity(), ShizukuManager.Callback {
             if (state == ShizukuManager.State.PERMISSION_NEEDED ||
                 state == ShizukuManager.State.PERMISSION_DENIED
             ) View.VISIBLE else View.GONE
-        buttonAuthorize.isEnabled = !busy &&
+        buttonAuthorize.isEnabled = !activeWork &&
             (state == ShizukuManager.State.PERMISSION_NEEDED || state == ShizukuManager.State.PERMISSION_DENIED)
-        buttonOpenShizuku.isEnabled = !busy
+        buttonOpenShizuku.isEnabled = !activeWork
     }
 
     /**
