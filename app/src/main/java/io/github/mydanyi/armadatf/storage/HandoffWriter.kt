@@ -46,10 +46,13 @@ class HandoffWriter(context: Context) {
     fun write(handoff: JSONObject): File {
         val validated = validate(handoff)
         val payload = encode(validated.canonical)
-        // Persist the private pending copy BEFORE attempting the TF write so a
-        // later failure is retryable without repartitioning.
-        synchronized(PENDING_LOCK) { atomicWrite(pendingFile(), payload) }
-        return publish(payload, validated.publicFsUuid)
+        // Pending write and publication are serialised under the shared lock so
+        // no other writer can slip a different handoff into the gap. A failed
+        // publication leaves the pending copy in place for [retry].
+        return synchronized(PENDING_LOCK) {
+            atomicWrite(pendingFile(), payload)
+            publish(payload, validated.publicFsUuid)
+        }
     }
 
     /**
@@ -60,11 +63,11 @@ class HandoffWriter(context: Context) {
      * @throws HandoffException `handoff_invalid` when no valid pending copy
      * exists, `public_volume_missing`/`handoff_write_failed` as in [write].
      */
-    fun retry(): File {
+    fun retry(): File = synchronized(PENDING_LOCK) {
         val bytes = readPendingBytes()
             ?: throw HandoffException(ERR_HANDOFF_INVALID, "no pending handoff to retry")
         val validated = parsePayload(bytes)
-        return publish(bytes, validated.publicFsUuid)
+        publish(bytes, validated.publicFsUuid)
     }
 
     /**
@@ -78,11 +81,23 @@ class HandoffWriter(context: Context) {
      * original missing-file error for callers that hold no captured payload.
      */
     fun retryExpected(expected: JSONObject): File? {
-        val expectedBytes = encode(validate(expected).canonical)
-        val bytes = readPendingBytes() ?: return null
-        val validated = parsePayload(bytes)
-        if (!bytes.contentEquals(expectedBytes)) return null
-        return publish(bytes, validated.publicFsUuid)
+        val validated = validate(expected)
+        val expectedBytes = encode(validated.canonical)
+        val publicFsUuid = validated.publicFsUuid
+        // Read, validate, compare and publish stay inside the shared lock: a
+        // corrupt pending copy still throws instead of looking superseded, and
+        // an exact byte match makes the pre-helper public_fs_uuid authoritative.
+        return publishExpectedHandoff(
+            PENDING_LOCK,
+            expectedBytes,
+            {
+                val bytes = readPendingBytes()
+                if (bytes != null) parsePayload(bytes)
+                bytes
+            },
+        ) { bytes ->
+            publish(bytes, publicFsUuid)
+        }
     }
 
     /**

@@ -3,10 +3,10 @@ package io.github.mydanyi.armadatf.ui
 import android.content.Context
 import android.content.res.Configuration
 import android.os.Build
+import io.github.mydanyi.armadatf.domain.FrameworkInstanceId
 import org.json.JSONObject
 import java.io.File
 import java.util.Locale
-import java.util.UUID
 
 /**
  * Durable handle of one started migration: the retained move id plus the exact
@@ -15,6 +15,11 @@ import java.util.UUID
  *
  * The disk id and selected private UUID are stored next to the request so a
  * swapped or missing card can never inherit an old result.
+ *
+ * [frameworkId] is the canonical identity of the framework instance that
+ * issued [moveId]. A numeric id is only meaningful inside that instance, so it
+ * is the only admissible proof for polling or settling the id; a missing value
+ * never proves one. Its boot UUID also stands in for an unreadable [bootId].
  *
  * [bootId] is the optional kernel boot id captured when the request was
  * persisted. It is the only admissible proof that a later launch runs on a
@@ -31,6 +36,8 @@ data class MigrationHandle(
     val state: String,
     val errorCode: String? = null,
     val bootId: String? = null,
+    /** Canonical framework instance that issued [moveId]; never a guess. */
+    val frameworkId: String? = null,
 ) {
 
     /**
@@ -51,54 +58,72 @@ data class MigrationHandle(
 
     /**
      * True only when this handle is still one a restart may settle (`starting`,
-     * `running` or `unverified`) and the kernel boot id saved for it differs
-     * from [currentBootId]. Both sides must be valid canonical UUIDs, so a
-     * missing, unreadable or malformed id never proves a reboot.
+     * `running` or `unverified`) and the kernel boot it was created in differs
+     * from [currentBootId]. The saved side is the stored boot id or, when that
+     * read failed, the boot UUID inside [frameworkId]. Both sides must be valid
+     * canonical UUIDs, so a missing, unreadable or malformed value never proves
+     * a reboot.
      *
      * A full reboot definitively ended any old native task, so a retained move
      * id does not override this: framework move ids restart and may be reused
-     * after boot. Terminal or unrecognised states never recover this way.
+     * after boot. A framework-only restart keeps the kernel boot id and is
+     * therefore never a reboot. Terminal or unrecognised states never recover
+     * this way.
      */
     fun hasRebooted(currentBootId: String?): Boolean {
         if (state !in RECOVERABLE_STATES) return false
-        val saved = canonicalBootId(bootId) ?: return false
+        val saved = canonicalBootId(bootId)
+            ?: FrameworkInstanceId.bootIdOf(frameworkId)
+            ?: return false
         val current = canonicalBootId(currentBootId) ?: return false
         return saved != current
     }
 
     /**
      * True only when this persisted handle may be polled or resumed inside the
-     * running boot: it must still be a live request (`running`/`unverified`),
-     * carry a real native move id (framework ids start at 0, so 0 is a
-     * legitimate id), and prove the same kernel boot on both sides.
+     * running framework instance: it must still be a live request
+     * (`running`/`unverified`), carry a real native move id (framework ids start
+     * at 0, so 0 is a legitimate id), and prove the same framework instance.
      *
-     * A disk-loaded id is never proof on its own; the kernel boot id is what
-     * ties the persisted request to the native task that produced it. A
-     * missing, unreadable or changed boot yields false, so an unproven legacy
-     * id is never polled.
+     * The kernel boot id is not enough on its own: a framework-only restart
+     * keeps it while every native move id is renumbered, so only [frameworkId]
+     * ties the request to the namespace that issued the id. A missing,
+     * unreadable or different instance yields false, so an unproven legacy id
+     * is never polled.
      */
-    fun canPollInBoot(currentBootId: String?): Boolean {
+    fun canPollInFramework(currentFrameworkId: String?): Boolean {
         if (state != STATE_RUNNING && state != STATE_UNVERIFIED) return false
         if (!isValidNativeMoveId(moveId)) return false
-        val saved = canonicalBootId(bootId) ?: return false
-        val current = canonicalBootId(currentBootId) ?: return false
-        return saved == current
+        return FrameworkInstanceId.matches(frameworkId, currentFrameworkId)
     }
 
     /**
      * Recovery baseline for a legacy request whose saved boot proof is absent
      * or malformed and which no retained native record describes. The retained
-     * id was never proven in this boot, so it is dropped instead of being
-     * stamped with the live boot; the request identity and the unresolved
-     * state stay. [liveBootId] is stored only when it is a canonical UUID, so
-     * even an unreadable live boot leaves the id dropped and the handle
-     * unpollable.
+     * id and its namespace were never proven, so both are dropped instead of
+     * being stamped with the live instance; the request identity and the
+     * unresolved state stay. An already known original boot id is preserved,
+     * and [liveBootId] is stored only when it is a canonical UUID.
      *
      * The baseline can only support a later full-reboot recovery from the
      * actual source/destination; it can never make the old id pollable again.
      */
     fun withRecoveryBaseline(liveBootId: String?): MigrationHandle =
-        copy(moveId = null, bootId = canonicalBootId(liveBootId))
+        copy(
+            moveId = null,
+            frameworkId = null,
+            bootId = canonicalBootId(bootId) ?: canonicalBootId(liveBootId),
+        )
+
+    /**
+     * True only for a request that may be reduced to a kernel recovery
+     * baseline: still unresolved, without framework proof and with a numeric id
+     * this process did not obtain ([processOwnedMoveId]). A process-owned id
+     * stays, because the framework-only restart that hid its record did not end
+     * that native task, and any framework proof keeps the handle pollable too.
+     */
+    fun isUnprovenLegacy(processOwnedMoveId: Boolean): Boolean =
+        isUnresolved && !processOwnedMoveId && frameworkId == null
 
     companion object {
         const val STATE_STARTING = "starting"
@@ -123,20 +148,12 @@ data class MigrationHandle(
 
         /**
          * Canonical lowercase form of [raw], or `null` unless it is a full UUID.
-         * The round-trip check rejects the shortened or padded forms that
-         * [UUID.fromString] may accept, so arbitrary text never becomes reboot
-         * proof. Pure: the caller does the file read.
+         * The round-trip check inside [FrameworkInstanceId.canonicalBootUuid]
+         * rejects the shortened or padded forms a permissive parser may accept,
+         * so arbitrary text never becomes reboot proof. The caller reads files.
          */
-        fun canonicalBootId(raw: String?): String? {
-            val value = raw?.trim().orEmpty()
-            if (value.isEmpty()) return null
-            val parsed = try {
-                UUID.fromString(value)
-            } catch (t: IllegalArgumentException) {
-                return null
-            }
-            return parsed.toString().takeIf { it == value }
-        }
+        fun canonicalBootId(raw: String?): String? =
+            FrameworkInstanceId.canonicalBootUuid(raw)
     }
 }
 
@@ -304,6 +321,7 @@ object AppSettings {
                     it.isNotEmpty() && it != "null"
                 },
                 bootId = MigrationHandle.canonicalBootId(json.optString("boot_id")),
+                frameworkId = FrameworkInstanceId.canonical(json.optString("framework_id")),
             )
         } catch (t: Exception) {
             null
@@ -326,6 +344,7 @@ object AppSettings {
             handle.privateUuid?.let { json.put("private_uuid", it) }
             handle.errorCode?.let { json.put("error_code", it) }
             MigrationHandle.canonicalBootId(handle.bootId)?.let { json.put("boot_id", it) }
+            FrameworkInstanceId.canonical(handle.frameworkId)?.let { json.put("framework_id", it) }
             editor.putString(KEY_MIGRATION_HANDLE, json.toString())
         }
         editor.apply()

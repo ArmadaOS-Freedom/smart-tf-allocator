@@ -15,7 +15,12 @@ import org.junit.Test
  */
 class MigrationHandleUnresolvedTest {
 
-    private fun handle(state: String, moveId: Int? = 7, bootId: String? = null) = MigrationHandle(
+    private fun handle(
+        state: String,
+        moveId: Int? = 7,
+        bootId: String? = null,
+        frameworkId: String? = null,
+    ) = MigrationHandle(
         moveId = moveId,
         diskId = "disk-1",
         kind = "primary",
@@ -25,29 +30,38 @@ class MigrationHandleUnresolvedTest {
         privateUuid = "1111-2222",
         state = state,
         bootId = bootId,
+        frameworkId = frameworkId,
     )
 
     private companion object {
         const val BOOT_A = "3f8a1c2e-9b4d-4a61-8f2e-0c5d7b1a6e93"
         const val BOOT_B = "a71d5e0c-2c48-4f9b-b3a7-6d81c4f2b0e5"
+
+        /** Same kernel boot, later framework start: every move was renumbered. */
+        const val FW_A = "3f8a1c2e-9b4d-4a61-8f2e-0c5d7b1a6e93:1:5921"
+        const val FW_B = "3f8a1c2e-9b4d-4a61-8f2e-0c5d7b1a6e93:2:1834"
+
+        /** Another kernel boot that happens to report the same counters. */
+        const val FW_C = "a71d5e0c-2c48-4f9b-b3a7-6d81c4f2b0e5:1:5921"
     }
 
-    // --- current-boot polling policy -----------------------------------------
+    // --- framework-instance polling policy -----------------------------------
 
     @Test
-    fun legacyRetainedIdWithoutBootProofNeverPollsInReady() {
-        // The saved handle names id 7 but has no boot id, so nothing ties it to
-        // a native task in this boot: not even a READY transition may poll it.
-        val legacy = handle("running", moveId = 7, bootId = null)
-        assertFalse(legacy.canPollInBoot(BOOT_A))
+    fun legacyRetainedIdWithoutFrameworkProofNeverPollsInReady() {
+        // The saved handle names id 7 but no framework instance, so nothing
+        // ties it to a native task: not even a READY transition may poll it.
+        val legacy = handle("running", moveId = 7, bootId = BOOT_A)
+        assertFalse(legacy.canPollInFramework(FW_A))
 
         // The production baseline stores the live boot and drops the unproven
         // id, so the request stays unresolved and unpollable.
         val baseline = legacy.withRecoveryBaseline(BOOT_A)
         assertNull(baseline.moveId)
+        assertNull(baseline.frameworkId)
         assertEquals(BOOT_A, baseline.bootId)
         assertTrue(baseline.isUnresolved)
-        assertFalse(baseline.canPollInBoot(BOOT_A))
+        assertFalse(baseline.canPollInFramework(FW_A))
     }
 
     @Test
@@ -64,7 +78,7 @@ class MigrationHandleUnresolvedTest {
         assertEquals(legacy.sourceUuid, baseline.sourceUuid)
         assertEquals(legacy.privateUuid, baseline.privateUuid)
         assertEquals(legacy.packageName, baseline.packageName)
-        assertFalse(baseline.canPollInBoot(BOOT_A))
+        assertFalse(baseline.canPollInFramework(FW_A))
         assertFalse(baseline.hasRebooted(BOOT_A))
     }
 
@@ -79,38 +93,76 @@ class MigrationHandleUnresolvedTest {
 
     @Test
     fun recoveryBaselineNeverPollsTheOldResultAndLaterBootOnlyProvesTheReboot() {
-        val baseline = handle("unverified", moveId = 7, bootId = null)
+        val baseline = handle("unverified", moveId = 7, bootId = BOOT_A, frameworkId = FW_B)
             .withRecoveryBaseline(BOOT_A)
-        assertFalse(baseline.canPollInBoot(BOOT_A))
+        assertNull(baseline.frameworkId)
+        assertFalse(baseline.canPollInFramework(FW_A))
+        assertFalse(baseline.canPollInFramework(FW_B))
         // A later full reboot is real proof, but the dropped id stays dropped.
         assertTrue(baseline.hasRebooted(BOOT_B))
-        assertFalse(baseline.canPollInBoot(BOOT_B))
+        assertFalse(baseline.canPollInFramework(FW_C))
     }
 
     @Test
-    fun genuineSameBootIdRemainsPollable() {
-        assertTrue(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
-        assertTrue(handle("unverified", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
+    fun matchingFrameworkAcceptsTheOriginalZeroAndSeven() {
+        assertTrue(handle("running", moveId = 0, frameworkId = FW_A).canPollInFramework(FW_A))
+        assertTrue(handle("unverified", moveId = 7, frameworkId = FW_A).canPollInFramework(FW_A))
     }
 
     @Test
-    fun changedMissingOrMalformedBootIsNeverPollable() {
-        assertFalse(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_B))
-        assertFalse(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot(null))
-        assertFalse(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot(""))
-        assertFalse(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot("not-a-uuid"))
-        assertFalse(handle("running", moveId = 7, bootId = null).canPollInBoot(BOOT_A))
-        assertFalse(handle("running", moveId = 7, bootId = "boot-one").canPollInBoot("boot-one"))
+    fun anotherFrameworkInstanceCannotReleaseIdZero() {
+        // A framework-only restart keeps the kernel boot, reports a new start
+        // count and renumbers moves from 0, so the same number now names an
+        // unrelated move: its failure must not release the saved id.
+        val saved = handle("running", moveId = 0, bootId = BOOT_A, frameworkId = FW_A)
+        assertFalse(saved.canPollInFramework(FW_B))
+        assertFalse(saved.canPollInFramework(FW_C))
+        assertFalse(saved.canPollInFramework(null))
+        assertFalse(saved.canPollInFramework(""))
+        assertFalse(saved.canPollInFramework("not-an-identity"))
+        assertFalse(handle("running", moveId = 7, frameworkId = "boot").canPollInFramework("boot"))
+        assertFalse(handle("running", moveId = 7, frameworkId = null).canPollInFramework(FW_A))
+    }
+
+    @Test
+    fun frameworkOnlyRestartIsNeverAReboot() {
+        // Same kernel boot, later start count: the old native task may still be
+        // running inside the new instance, so this never looks like a reboot.
+        val saved = handle("running", moveId = 0, bootId = BOOT_A, frameworkId = FW_B)
+        assertFalse(saved.hasRebooted(BOOT_A))
+        assertTrue(saved.hasRebooted(BOOT_B))
+    }
+
+    @Test
+    fun frameworkIdentitySuppliesTheBootIdWhenTheFileReadFailed() {
+        // The privileged tuple carries the same kernel boot UUID, so a failed
+        // app-side boot_id read must not turn a framework restart into a reboot.
+        val saved = handle("unverified", moveId = 0, bootId = null, frameworkId = FW_A)
+        assertFalse(saved.hasRebooted(BOOT_A))
+        assertTrue(saved.hasRebooted(BOOT_B))
+    }
+
+    @Test
+    fun onlyAnUnownedLegacyHandleMayBaseline() {
+        assertTrue(handle("running", moveId = 0).isUnprovenLegacy(processOwnedMoveId = false))
+        // The exact id this process obtained is preserved even without a boot
+        // or framework proof: the start reply already bound it here.
+        assertFalse(handle("running", moveId = 0).isUnprovenLegacy(processOwnedMoveId = true))
+        assertFalse(
+            handle("running", moveId = 0, frameworkId = FW_A)
+                .isUnprovenLegacy(processOwnedMoveId = false),
+        )
+        assertFalse(handle("completed", moveId = 0).isUnprovenLegacy(processOwnedMoveId = false))
     }
 
     @Test
     fun terminalUnknownStartingAndIdlessStatesAreNeverPollable() {
-        assertFalse(handle("starting", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
-        assertFalse(handle("completed", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
-        assertFalse(handle("failed", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
-        assertFalse(handle("unknown", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
-        assertFalse(handle("running", moveId = null, bootId = BOOT_A).canPollInBoot(BOOT_A))
-        assertFalse(handle("running", moveId = -1, bootId = BOOT_A).canPollInBoot(BOOT_A))
+        assertFalse(handle("starting", moveId = 7, frameworkId = FW_A).canPollInFramework(FW_A))
+        assertFalse(handle("completed", moveId = 7, frameworkId = FW_A).canPollInFramework(FW_A))
+        assertFalse(handle("failed", moveId = 7, frameworkId = FW_A).canPollInFramework(FW_A))
+        assertFalse(handle("unknown", moveId = 7, frameworkId = FW_A).canPollInFramework(FW_A))
+        assertFalse(handle("running", moveId = null, frameworkId = FW_A).canPollInFramework(FW_A))
+        assertFalse(handle("running", moveId = -1, frameworkId = FW_A).canPollInFramework(FW_A))
     }
 
     @Test
@@ -121,9 +173,19 @@ class MigrationHandleUnresolvedTest {
         assertFalse(MigrationHandle.isValidNativeMoveId(null))
         assertFalse(MigrationHandle.isValidNativeMoveId(-1))
         assertFalse(MigrationHandle.isValidNativeMoveId(Int.MIN_VALUE))
-        val zero = handle("running", moveId = 0, bootId = BOOT_A)
-        assertTrue(zero.canPollInBoot(BOOT_A))
+        val zero = handle("running", moveId = 0, frameworkId = FW_A)
+        assertTrue(zero.canPollInFramework(FW_A))
         assertTrue(zero.isUnresolved)
+    }
+
+    @Test
+    fun baselineKeepsAnAlreadyKnownOriginalBootId() {
+        // A stored boot id names the boot the request came from; a later live
+        // value must not overwrite it and hide a real reboot.
+        val baseline = handle("unverified", moveId = 7, bootId = BOOT_A)
+            .withRecoveryBaseline(BOOT_B)
+        assertNull(baseline.moveId)
+        assertEquals(BOOT_A, baseline.bootId)
     }
 
     @Test

@@ -3,7 +3,9 @@ package io.github.mydanyi.armadatf.storage
 import android.os.Binder
 import android.os.IBinder
 import android.os.StatFs
+import io.github.mydanyi.armadatf.domain.FrameworkInstanceId
 import io.github.mydanyi.armadatf.domain.Identifiers
+import java.io.File
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 
@@ -71,6 +73,52 @@ class NativeMigration(
     fun moveStatus(moveId: Int): Int = privileged {
         (callPackage("getMoveStatus", arrayOf(INT), moveId) as? Number)?.toInt()
             ?: throw NativeMigrationException("getMoveStatus did not return a status")
+    }
+
+    /**
+     * Canonical identity of the framework instance running right now, or `null`
+     * when it cannot be read.
+     *
+     * `PackageManagerService` is rebuilt on every framework-only restart and
+     * numbers its native moves from 0 again, while the kernel boot id does not
+     * change. `SystemServer` therefore publishes its own start count and start
+     * time before the package manager is bootstrapped; both are read here
+     * through the same privileged reflection path the native moves already use,
+     * together with the kernel boot id.
+     *
+     * A denied or unavailable read yields `null` instead of a default, and a
+     * count that changes between the property reads is refused as a mixed
+     * tuple. This is a correctness witness for the move-id namespace only; it
+     * is never proof that an old native task stopped. Only a real kernel boot
+     * change proves that.
+     */
+    fun currentFrameworkId(): String? = try {
+        privileged {
+            val bootUuid = kernelBootUuid()
+            val count = systemProperty(PROP_START_COUNT)
+            val elapsed = systemProperty(PROP_START_ELAPSED)
+            // A restart between the reads would mix two instances; the count
+            // only ever grows, so an unchanged re-read keeps the tuple whole.
+            val recheck = systemProperty(PROP_START_COUNT)
+            if (count == null || count != recheck) return@privileged null
+            FrameworkInstanceId.create(bootUuid, count, elapsed)
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun kernelBootUuid(): String? = try {
+        File(BOOT_ID_FILE).readText()
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun systemProperty(name: String): String? = try {
+        val getter = Class.forName(SYSTEM_PROPERTIES)
+            .getMethod("get", String::class.java)
+        invoke(getter, null, name) as? String
+    } catch (e: Exception) {
+        null
     }
 
     /**
@@ -603,6 +651,18 @@ class NativeMigration(
         const val STORAGE_INTERFACE = "android.os.storage.IStorageManager"
         const val PACKAGE_INTERFACE = "android.content.pm.IPackageManager"
         const val USER_INTERFACE = "android.os.IUserManager"
+
+        /** Kernel file carrying the boot UUID. */
+        const val BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
+
+        /** Hidden platform property reader used for the system-server tuple. */
+        const val SYSTEM_PROPERTIES = "android.os.SystemProperties"
+
+        /** Framework restart counter published before PackageManager bootstrap. */
+        const val PROP_START_COUNT = "sys.system_server.start_count"
+
+        /** Milliseconds since that framework start. */
+        const val PROP_START_ELAPSED = "sys.system_server.start_elapsed"
 
         const val EXPAND_MARKER = "/mnt/expand/"
 

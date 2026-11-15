@@ -20,6 +20,7 @@ import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
 import io.github.mydanyi.armadatf.R
+import io.github.mydanyi.armadatf.domain.FrameworkInstanceId
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -182,8 +183,9 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     override fun onState(state: ShizukuManager.State, identity: String?) {
         when (state) {
             ShizukuManager.State.READY -> {
+                // The fresh overview is what supplies the current framework
+                // instance; a disk-loaded id is never resumed before that.
                 requestOverview()
-                resumeSavedPolling()
             }
             ShizukuManager.State.BINDER_LOST -> {
                 setStateText(R.string.migration_state_not_ready, R.color.color_warning)
@@ -202,13 +204,16 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         // An id from a previous kernel boot is not authoritative: that native
         // task ended with the reboot, so its answer is skipped until the
         // destination itself has been verified.
-        if (handle?.hasRebooted(AppSettings.currentBootId()) == true) return
-        // Only an id this boot actually owns may be attributed to the saved
-        // request: a stale answer for a dropped legacy id must neither adopt an
-        // id-less baseline nor release its unresolved protection.
+        if (handle?.hasRebooted(liveKernelBootId()) == true) return
+        // Only an id this framework instance actually owns may be attributed
+        // to the saved request: a stale answer for a dropped legacy id must
+        // neither adopt an id-less baseline nor release its protection.
         val owned = ownedMoveId()
         if (status != null) {
             if (owned == null || status.moveId != owned) return
+            // The answer must come from the instance the handle was created in,
+            // otherwise an unrelated move of the same number could settle it.
+            if (!frameworkMatchesHandle(status.frameworkId)) return
             when (status.state) {
                 ShizukuManager.MIGRATION_RUNNING -> adoptRunning(status)
                 ShizukuManager.MIGRATION_COMPLETED -> verifyCompletedMove()
@@ -275,7 +280,10 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     private fun applyOverview(info: ShizukuManager.MigrationOverview) {
         overview = info
         val saved = handle
+        // The privileged reader also reaches the kernel boot id when the app
+        // side read is denied; a framework-only restart keeps it unchanged.
         val liveBoot = AppSettings.currentBootId()
+            ?: FrameworkInstanceId.bootIdOf(info.frameworkId)
         if (saved != null && saved.diskId == info.diskId && saved.isUnresolved &&
             saved.hasRebooted(liveBoot)
         ) {
@@ -287,7 +295,8 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
             // decide the outcome; a fast completion before the relaunch is
             // verified from the destination, never restarted.
             val active = info.activeMigration?.takeIf {
-                MigrationHandle.isValidNativeMoveId(it.moveId) && activeMatches(saved, it)
+                MigrationHandle.isValidNativeMoveId(it.moveId) &&
+                    activeMatches(saved, it, info.frameworkId)
             }
             when {
                 active == null -> recoverWithoutRetainedMove(saved)
@@ -296,13 +305,23 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
                 }
                 active.state == ShizukuManager.MIGRATION_COMPLETED -> {
                     adoptHandle(
-                        saved.copy(moveId = active.moveId, bootId = provenBootId(saved, liveBoot)),
+                        saved.copy(
+                            moveId = active.moveId,
+                            bootId = provenBootId(saved, liveBoot),
+                            // The record's own origin identity, never a current
+                            // summary stamped onto a legacy id.
+                            frameworkId = active.frameworkId,
+                        ),
                     )
                     verifySavedDestination()
                 }
                 active.state == ShizukuManager.MIGRATION_FAILED -> {
                     adoptHandle(
-                        saved.copy(moveId = active.moveId, bootId = provenBootId(saved, liveBoot)),
+                        saved.copy(
+                            moveId = active.moveId,
+                            bootId = provenBootId(saved, liveBoot),
+                            frameworkId = active.frameworkId,
+                        ),
                     )
                     markFailed(active.error ?: "failed_native")
                 }
@@ -312,15 +331,17 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
                             moveId = active.moveId,
                             state = ShizukuManager.MIGRATION_RUNNING,
                             bootId = provenBootId(saved, liveBoot),
+                            frameworkId = active.frameworkId,
                         ),
                     )
-                    manager.startMigrationPolling(active.moveId)
+                    manager.startMigrationPolling(active.moveId, active.frameworkId)
                 }
             }
         } else if (saved == null) {
             val active = info.activeMigration
             if (active != null && MigrationHandle.isValidNativeMoveId(active.moveId) &&
-                active.state == ShizukuManager.MIGRATION_RUNNING
+                active.state == ShizukuManager.MIGRATION_RUNNING &&
+                sameFramework(active, info.frameworkId)
             ) {
                 // A retained native move after a relaunch: adopt, never restart.
                 val restored = MigrationHandle(
@@ -331,14 +352,15 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
                     packageName = active.packageName,
                     sourceUuid = "",
                     privateUuid = info.selectedPrivateUuid,
-                    bootId = AppSettings.currentBootId(),
+                    bootId = liveBoot,
+                    frameworkId = active.frameworkId,
                     state = ShizukuManager.MIGRATION_RUNNING,
                 )
                 adoptHandle(restored)
-                manager.startMigrationPolling(active.moveId)
+                manager.startMigrationPolling(active.moveId, active.frameworkId)
             }
         }
-        resumeSavedPolling()
+        resumeSavedPolling(info.frameworkId)
         render()
     }
 
@@ -388,12 +410,16 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     private fun recoverWithoutRetainedMove(saved: MigrationHandle) {
         keepUnresolved(saved)
         val current = handle ?: return
-        // A retained id without a matching boot proof was never proven in this
-        // boot, so it is dropped instead of being given the live boot. Request
-        // and card fields plus the unresolved state stay; a later full reboot
-        // with an actual source/destination match is the only recovery left.
-        if (MigrationHandle.canonicalBootId(current.bootId) == null) {
-            val baseline = current.withRecoveryBaseline(AppSettings.currentBootId())
+        // Only a legacy request with no native framework proof may be reduced
+        // to a kernel baseline. An id this process obtained from the native
+        // start, or any handle that already names a framework instance, keeps
+        // its numeric id: the framework-only restart did not end that task.
+        if (current.isUnprovenLegacy(ownedByProcess(current))) {
+            // The unproven id and its namespace are dropped instead of being
+            // attributed to the current framework instance. Request and card
+            // fields plus the unresolved state stay; a later full reboot with
+            // an actual source/destination match is the only recovery left.
+            val baseline = current.withRecoveryBaseline(liveKernelBootId())
             handle = baseline
             currentMoveId = null
             lastProgress = null
@@ -401,30 +427,30 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
             manager.stopMigrationPolling()
             pushLog(LEVEL_INFO, "migration_boot_baseline", null)
         }
-        // A same-boot id remains the only live lead; its poll may answer later.
-        if (handle?.moveId != null) return
-        // No id can settle this request inside the same kernel boot.
+        // A same-instance id remains the only live lead; its poll may answer.
+        val live = handle ?: return
+        if (live.canPollInFramework(overviewFrameworkId())) return
+        // No id can settle this request inside the current framework instance,
+        // so the existing full-restart guidance is the only way forward.
         terminalText = getString(R.string.migration_status_recovery_reboot)
         terminalColor = R.color.color_warning
         setKeepScreenOn(false)
         render()
     }
 
-    private fun resumeSavedPolling() {
+    private fun resumeSavedPolling(currentFrameworkId: String?) {
         val h = handle ?: return
         if (h.diskId != diskId) return
-        val liveBoot = AppSettings.currentBootId()
         // An id from a previous kernel boot is not resumable: that task ended
         // with the reboot, so polling it again would adopt a stale answer.
-        if (h.hasRebooted(liveBoot)) return
+        if (h.hasRebooted(liveKernelBootId())) return
         val savedId = h.moveId ?: return
         if (h.state != ShizukuManager.MIGRATION_RUNNING && h.state != STATE_UNVERIFIED) return
-        // A disk-loaded id needs the current-boot policy; the process-local id
-        // is accepted only for that exact saved id, because a fresh native start
-        // or a matching retained record supplied it here.
-        if (!h.canPollInBoot(liveBoot) && currentMoveId != savedId) return
+        // Only a handle that names the framework instance running now may poll;
+        // the kernel boot id alone never authorises a numeric id.
+        if (!h.canPollInFramework(currentFrameworkId)) return
         currentMoveId = savedId
-        manager.startMigrationPolling(savedId)
+        manager.startMigrationPolling(savedId, h.frameworkId)
     }
 
     private fun adoptHandle(next: MigrationHandle) {
@@ -681,7 +707,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
             packageName = prepared.packageName,
             sourceUuid = prepared.sourceUuid,
             privateUuid = prepared.selectedPrivateUuid ?: overview?.selectedPrivateUuid,
-            bootId = AppSettings.currentBootId(),
+            bootId = liveKernelBootId(),
             state = STATE_STARTING,
         )
         handle = saved
@@ -726,11 +752,17 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
                 requestOverview()
                 return@startMigration
             }
-            val running = saved.copy(moveId = status.moveId, state = status.state)
+            // The native reply names the instance that issued the id; an reply
+            // without one keeps the request unverified instead of pollable.
+            val running = saved.copy(
+                moveId = status.moveId,
+                state = status.state,
+                frameworkId = status.frameworkId,
+            )
             adoptHandle(running)
             lastProgress = status.progress
             setKeepScreenOn(true)
-            manager.startMigrationPolling(status.moveId)
+            manager.startMigrationPolling(status.moveId, status.frameworkId)
             render()
         }
     }
@@ -1040,6 +1072,8 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         "failed_native" -> getString(R.string.migration_err_failed_native)
         "destination_mismatch" -> getString(R.string.migration_err_destination_mismatch)
         "destination_unverified" -> getString(R.string.migration_status_unverified)
+        "move_identity_unverified" -> getString(R.string.migration_status_unverified)
+        "framework_identity_unavailable" -> getString(R.string.migration_err_unavailable)
         "migration_interrupted" -> getString(R.string.migration_status_interrupted)
         "source_changed" -> getString(R.string.migration_err_source_changed)
         "target_not_mounted", "target_missing" -> getString(R.string.migration_err_target_not_mounted)
@@ -1130,9 +1164,12 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     private fun activeMatches(
         handle: MigrationHandle,
         active: ShizukuManager.MigrationStatus,
+        currentFrameworkId: String?,
     ): Boolean {
         // A missing active kind is not a match: the retained record must name
-        // the actual request it describes.
+        // the actual request it describes in the framework instance running
+        // now.
+        if (!sameFramework(active, currentFrameworkId)) return false
         if (handle.kind != active.kind) return false
         if (handle.packageName != active.packageName) return false
         val target = active.targetUuid ?: return false
@@ -1144,16 +1181,53 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         handle == captured && AppSettings.migrationHandle(this) == captured
 
     /**
-     * The native id this process may attribute a listener answer to: an id a
-     * fresh native start or a matching retained record already supplied here,
-     * or a persisted id whose current-boot policy passes. A disk-loaded id
-     * alone is never proof of ownership.
+     * The native id this process may attribute a listener answer to: the saved
+     * id must still be valid and the handle must name the framework instance
+     * that is running now. The kernel boot id alone never proves ownership, so
+     * a disk-loaded id is not enough.
      */
     private fun ownedMoveId(): Int? {
         val h = handle ?: return null
         val saved = h.moveId ?: return null
-        if (currentMoveId == saved) return saved
-        return saved.takeIf { h.canPollInBoot(AppSettings.currentBootId()) }
+        return saved.takeIf { h.canPollInFramework(overviewFrameworkId()) }
+    }
+
+    /**
+     * Kernel boot UUID of the running kernel: the app-side file read when it
+     * works, else the UUID inside the latest privileged framework identity. A
+     * framework-only restart keeps that UUID, so it never becomes reboot proof.
+     */
+    private fun liveKernelBootId(): String? =
+        AppSettings.currentBootId() ?: FrameworkInstanceId.bootIdOf(overview?.frameworkId)
+
+    /** The framework instance named by the latest privileged overview. */
+    private fun overviewFrameworkId(): String? = overview?.frameworkId
+
+    /**
+     * True when [actual] names the same framework instance the saved handle was
+     * created in, so a listener answer may be attributed to it.
+     */
+    private fun frameworkMatchesHandle(actual: String?): Boolean =
+        FrameworkInstanceId.matches(handle?.frameworkId, actual)
+
+    /**
+     * True when [active] is a retained record of the framework instance that is
+     * running now; a kernel-boot match alone is never enough.
+     */
+    private fun sameFramework(
+        active: ShizukuManager.MigrationStatus,
+        currentFrameworkId: String?,
+    ): Boolean = FrameworkInstanceId.matches(active.frameworkId, currentFrameworkId)
+
+    /**
+     * True when the saved numeric id is exactly the one this process obtained
+     * from a native start or a matching retained record, so it belongs to the
+     * running framework instance even if the app-side boot read failed.
+     */
+    private fun ownedByProcess(h: MigrationHandle): Boolean {
+        val id = h.moveId ?: return false
+        if (!MigrationHandle.isValidNativeMoveId(id)) return false
+        return currentMoveId == id
     }
 
     /**
@@ -1290,6 +1364,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
             "card_layout_unsupported",
             "permission_denied",
             "native_migration_unavailable",
+            "framework_identity_unavailable",
             "target_missing",
             "target_not_mounted",
             "already_at_target",
