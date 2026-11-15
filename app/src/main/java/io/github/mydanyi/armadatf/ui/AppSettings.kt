@@ -359,6 +359,16 @@ object AppSettings {
 }
 
 /**
+ * Kernel boot identity of the running system: the app-side [appBootId] read
+ * when it is a canonical UUID, else the boot UUID inside the latest privileged
+ * [frameworkId]. A framework-only restart keeps that UUID, so it is never
+ * reboot proof. Returns `null` when neither side is valid, so a missing or
+ * malformed value never invents a boot.
+ */
+internal fun currentMigrationBootId(appBootId: String?, frameworkId: String?): String? =
+    MigrationHandle.canonicalBootId(appBootId) ?: FrameworkInstanceId.bootIdOf(frameworkId)
+
+/**
  * Compares one observed storage location with the expected one for a saved
  * migration. Missing, blank or whitespace-only values are UNKNOWN on either
  * side, so an unreadable package or a missing volume can never verify an

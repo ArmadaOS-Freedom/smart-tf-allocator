@@ -345,4 +345,59 @@ class MigrationHandleUnresolvedTest {
         assertNull(MigrationHandle.canonicalBootId("   "))
         assertNull(MigrationHandle.canonicalBootId("3f8a1c2e9b4d4a618f2e0c5d7b1a6e93"))
     }
+
+    // --- privileged boot fallback for reboot recovery -----------------------
+
+    @Test
+    fun privilegedFrameworkSuppliesTheBootProofWhenTheAppReadIsDenied() {
+        // The app-side boot_id read is denied (null), but the privileged
+        // framework identity names a different kernel boot, so a saved request
+        // is proved rebooted from its own fallback boot UUID as well.
+        val current = currentMigrationBootId(null, FW_C)
+        assertEquals(BOOT_B, current)
+
+        val savedFallback = handle("unverified", moveId = 0, bootId = null, frameworkId = FW_A)
+        assertTrue(savedFallback.hasRebooted(current))
+
+        val savedStoredBoot = handle("running", moveId = 7, bootId = BOOT_A)
+        assertTrue(savedStoredBoot.hasRebooted(current))
+    }
+
+    @Test
+    fun sameKernelWithRenumberedFrameworkCountersIsStillNotAReboot() {
+        // A framework-only restart keeps the kernel boot UUID and only changes
+        // the start count, so the privileged fallback proves no reboot.
+        val current = currentMigrationBootId(null, FW_B)
+        assertEquals(BOOT_A, current)
+
+        val saved = handle("unverified", moveId = 0, bootId = null, frameworkId = FW_A)
+        assertFalse(saved.hasRebooted(current))
+    }
+
+    @Test
+    fun unknownOrMalformedCurrentBootMetadataStaysUnproven() {
+        assertNull(currentMigrationBootId(null, null))
+        assertNull(currentMigrationBootId("not-a-uuid", null))
+        assertNull(currentMigrationBootId("3f8a1c2e9b4d4a618f2e0c5d7b1a6e93", null))
+
+        val saved = handle("unverified", moveId = 0, bootId = BOOT_A)
+        assertFalse(saved.hasRebooted(currentMigrationBootId(null, null)))
+        // A saved handle without any proof is never recovered either.
+        assertFalse(
+            handle("unverified", moveId = 0, bootId = null)
+                .hasRebooted(currentMigrationBootId(null, null)),
+        )
+    }
+
+    @Test
+    fun aReadableAppBootIdIsPreferredOverThePrivilegedFallback() {
+        // The canonical app-side read wins; the framework fallback must not
+        // override a valid value with the boot it happens to carry.
+        assertEquals(BOOT_B, currentMigrationBootId(BOOT_B, FW_A))
+        assertEquals(BOOT_A, currentMigrationBootId(BOOT_A, FW_C))
+
+        val saved = handle("unverified", moveId = 0, bootId = BOOT_A)
+        assertTrue(saved.hasRebooted(currentMigrationBootId(BOOT_B, FW_A)))
+        assertFalse(saved.hasRebooted(currentMigrationBootId(BOOT_A, FW_C)))
+    }
 }

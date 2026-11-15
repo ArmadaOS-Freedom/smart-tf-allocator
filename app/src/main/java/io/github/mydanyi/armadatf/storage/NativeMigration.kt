@@ -1,8 +1,11 @@
 package io.github.mydanyi.armadatf.storage
 
+import android.annotation.SuppressLint
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.os.StatFs
+import io.github.mydanyi.armadatf.domain.BinderFrameworkIdentity
 import io.github.mydanyi.armadatf.domain.FrameworkInstanceId
 import io.github.mydanyi.armadatf.domain.Identifiers
 import java.io.File
@@ -41,6 +44,12 @@ data class VolumeCapacity(val totalBytes: Long?, val availableBytes: Long?)
 class NativeMigration(
     private val factoryCatalog: FactoryAppCatalog = FactoryAppCatalog(),
 ) {
+
+    /**
+     * Per-instance witness of the live package-service binder, used only on
+     * releases that do not publish the system-server tuple (Android 8).
+     */
+    private val binderIdentity = BinderFrameworkIdentity()
 
     /**
      * Current primary-storage UUID; `null` means internal storage.
@@ -86,6 +95,11 @@ class NativeMigration(
      * through the same privileged reflection path the native moves already use,
      * together with the kernel boot id.
      *
+     * Android 8 does not publish those properties. There the running package
+     * service binder is held and observed instead: the binder object is
+     * recreated with the framework, so one live binder on one kernel boot is
+     * the same witness without any system property.
+     *
      * A denied or unavailable read yields `null` instead of a default, and a
      * count that changes between the property reads is refused as a mixed
      * tuple. This is a correctness witness for the move-id namespace only; it
@@ -100,8 +114,18 @@ class NativeMigration(
             // A restart between the reads would mix two instances; the count
             // only ever grows, so an unchanged re-read keeps the tuple whole.
             val recheck = systemProperty(PROP_START_COUNT)
-            if (count == null || count != recheck) return@privileged null
-            FrameworkInstanceId.create(bootUuid, count, elapsed)
+            if (count != recheck) return@privileged null
+            val numeric = count?.let { FrameworkInstanceId.create(bootUuid, it, elapsed) }
+            if (numeric != null) return@privileged numeric
+            // Android 8 does not publish the system-server tuple; the package
+            // service binder is recreated on every framework restart, so a
+            // live binder plus the kernel boot witness the instance instead.
+            if (FrameworkInstanceId.canonicalBootUuid(bootUuid) == null) {
+                return@privileged null
+            }
+            val binder = binderFor(SERVICE_PACKAGE) ?: return@privileged null
+            val alive = binder.isBinderAlive && binder.pingBinder()
+            binderIdentity.observe(bootUuid, binder, alive)
         }
     } catch (e: Exception) {
         null
@@ -200,18 +224,40 @@ class NativeMigration(
             readUserApps(userId, MATCH_UNINSTALLED_PACKAGES)
         }
 
+    // Runs only inside the Shizuku root/shell UserService, where non-SDK API
+    // restrictions do not apply. A reflective query failure still propagates,
+    // so occupancy remains blocked instead of silently narrowed.
+    @SuppressLint("SoonBlockedPrivateApi")
     private fun installedAppsIn(
         userId: Int,
         factoryPackages: Set<String>,
         flags: Long = 0L,
     ): List<PackageSnapshot> {
-        val manager = systemService(SERVICE_PACKAGE, PACKAGE_INTERFACE)
+        val binder = binderFor(SERVICE_PACKAGE)
+            ?: throw NativeMigrationException("IPackageManager service is not available")
         val method = installedApplicationsMethod()
             ?: throw NativeMigrationException(
                 "IPackageManager.getInstalledApplications is not available",
             )
-        val slice = invoke(method, manager, flagsArgument(method, 0, flags), userId)
-        val entries = parceledList(slice)
+        val transactionCode = try {
+            Class.forName("$PACKAGE_INTERFACE\$Stub")
+                .getDeclaredField("TRANSACTION_getInstalledApplications")
+                .apply { isAccessible = true }
+                .getInt(null)
+        } catch (e: Exception) {
+            throw NativeMigrationException(
+                "IPackageManager.getInstalledApplications transaction is not available",
+                e,
+            )
+        }
+        val entries = CompleteApplicationQuery.read(
+            binder = binder,
+            transactionCode = transactionCode,
+            flags = flags,
+            longFlags = method.parameterTypes[0] == Long::class.javaPrimitiveType,
+            userId = userId,
+            modernContinuation = Build.VERSION.SDK_INT >= 34,
+        )
         val validated = if ((flags and MATCH_UNINSTALLED_PACKAGES) != 0L) {
             occupancyApplicationEntries(entries)
         } else {
@@ -592,18 +638,6 @@ class NativeMigration(
 
     private fun flagsArgument(method: Method, index: Int, flags: Long = 0L): Any =
         if (method.parameterTypes[index] == Long::class.javaPrimitiveType) flags else flags.toInt()
-
-    /** Unwraps the returned slice; `null` means the platform returned none. */
-    private fun parceledList(slice: Any?): List<*>? {
-        if (slice == null) return null
-        val getList = try {
-            Class.forName("android.content.pm.ParceledListSlice").getMethod("getList")
-        } catch (e: ReflectiveOperationException) {
-            throw NativeMigrationException("ParceledListSlice.getList is not available", e)
-        }
-        return invoke(getList, slice) as? List<*>
-            ?: throw NativeMigrationException("ParceledListSlice did not return a list")
-    }
 
     private fun asMoveId(value: Any?, method: String): Int =
         (value as? Number)?.toInt()

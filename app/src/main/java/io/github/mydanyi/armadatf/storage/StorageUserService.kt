@@ -770,6 +770,13 @@ class StorageUserService : IStorageService.Stub() {
                         ERR_FRAMEWORK_IDENTITY_UNAVAILABLE,
                         "the running framework instance could not be identified",
                     )
+                // A terminal record from an earlier request must never stand in
+                // for the move about to start. Running records stay: they are
+                // unresolved and still describe a live native task.
+                migrationRecords.entries.removeAll { entry ->
+                    entry.value.state == STATE_MIGRATION_COMPLETED ||
+                        entry.value.state == STATE_MIGRATION_FAILED
+                }
                 val moveId = when (pending.request.kind) {
                     MigrationKind.PRIMARY ->
                         nativeMigration.movePrimaryStorage(pending.targetNativeUuid)
@@ -778,13 +785,12 @@ class StorageUserService : IStorageService.Stub() {
                         pending.targetNativeUuid,
                     )
                 }
-                // A framework restart during the call renumbers moves, so the
-                // tuple is re-read and only an unchanged one is recorded.
-                val identityAfter = nativeMigration.currentFrameworkId()
-                val identityProven =
-                    FrameworkInstanceId.matches(identityBefore, identityAfter)
                 if (moveId < 0) {
-                    if (!identityProven) {
+                    // A framework restart during the call renumbers moves, so
+                    // the instance is re-read and only an unchanged one may
+                    // attribute this refusal.
+                    val identityAfter = nativeMigration.currentFrameworkId()
+                    if (!FrameworkInstanceId.matches(identityBefore, identityAfter)) {
                         // A refusal after an instance change cannot be
                         // attributed to the instance that issued the id: keep
                         // the request unresolved instead of a native failure.
@@ -799,11 +805,13 @@ class StorageUserService : IStorageService.Stub() {
                     )
                 }
 
+                // Retain the successful move and claim the busy slot before the
+                // post-start read, so an ambiguous observation can never lose
+                // the request or let older metadata answer for it.
                 val record = MigrationRecord(
                     moveId = moveId,
-                    // An unproven identity stays null: the retained id only
-                    // protects the slot and is never settled by a status call.
-                    frameworkId = if (identityProven) identityBefore else null,
+                    // Proven only after the same instance is observed below.
+                    frameworkId = null,
                     request = pending.request,
                     userId = pending.userId,
                     state = STATE_MIGRATION_RUNNING,
@@ -815,13 +823,24 @@ class StorageUserService : IStorageService.Stub() {
                 migrationRecords[moveId] = record
                 migrationActiveMoveId = moveId
                 trimMigrationRecords()
+
+                // Only now prove the origin; a matching instance replaces the
+                // record with its canonical id, otherwise it stays unresolved.
+                val identityAfter = nativeMigration.currentFrameworkId()
+                val retained = if (FrameworkInstanceId.matches(identityBefore, identityAfter)) {
+                    record.copy(frameworkId = identityBefore).also {
+                        migrationRecords[moveId] = it
+                    }
+                } else {
+                    record
+                }
                 log(
                     LEVEL_INFO,
                     "start_migration",
                     "kind=${pending.request.kind.jsonName} disk=${pending.request.diskId} " +
                         "target=${pending.request.targetUuid} move=$moveId",
                 )
-                return ok(recordJson(record))
+                return ok(recordJson(retained))
             } catch (e: MigrationRejectedException) {
                 log(LEVEL_WARN, "start_migration", e.code)
                 return failString(e.code, e.message)

@@ -14,13 +14,17 @@ import java.util.UUID
  * so the tuple below witnesses that a numeric id namespace is still the same
  * one that issued the id.
  *
- * Canonical form is `<boot-uuid>:<start-count>:<start-elapsed-ms>`: the full
- * lowercase kernel boot UUID, the positive system-server start count and the
- * nonnegative elapsed milliseconds since framework start, joined by a fixed
- * `:`. Anything missing, unparsable, out of range or differently shaped is not
- * an identity, so [canonical] returns `null` and [matches] is `false`.
+ * Two canonical forms name one instance. The
+ * `<boot-uuid>:<start-count>:<start-elapsed-ms>` form is the full lowercase
+ * kernel boot UUID, the positive system-server start count and the nonnegative
+ * elapsed milliseconds since framework start, joined by a fixed `:`. The
+ * `<boot-uuid>:binder:<witness-uuid>` form witnesses one live package-service
+ * binder on releases that do not publish that tuple (Android 8, `API 26`); the
+ * witness UUID is rotated for every new binder object or kernel boot.
+ * Anything missing, unparsable, out of range or differently shaped is not an
+ * identity, so [canonical] returns `null` and [matches] is `false`.
  *
- * This is a correctness witness only: the tuple names the framework instance
+ * This is a correctness witness only: the identity names the framework instance
  * that is running, never that an old native task ended. Only a real kernel boot
  * change proves that (see `MigrationHandle.hasRebooted`).
  */
@@ -28,6 +32,9 @@ object FrameworkInstanceId {
 
     /** Fixed field separator; a canonical UUID and decimal digits never contain it. */
     const val DELIMITER = ":"
+
+    /** Second-field marker of the binder-witnessed identity form. */
+    private const val BINDER_MARKER = "binder"
 
     private const val FIELD_COUNT = 3
 
@@ -52,6 +59,24 @@ object FrameworkInstanceId {
     }
 
     /**
+     * Builds the canonical binder-witnessed identity from the kernel boot id
+     * and a witness UUID, or `null` when either is missing or malformed.
+     *
+     * The witness UUID is generated for one live package-service binder on one
+     * kernel boot, so this form names that framework instance without relying
+     * on the system-server tuple. It never proves that an old native task
+     * ended; only a real kernel boot change does that.
+     */
+    fun createBinder(
+        kernelBootId: String?,
+        witnessId: String?,
+    ): String? {
+        val bootId = canonicalBootUuid(kernelBootId) ?: return null
+        val witness = canonicalBootUuid(witnessId) ?: return null
+        return bootId + DELIMITER + BINDER_MARKER + DELIMITER + witness
+    }
+
+    /**
      * Canonical form of [raw], or `null` unless every field is present, well
      * formed and in range. Re-emitting the parsed numbers drops leading zeros
      * and padding, so two spellings of one tuple collapse to one identity while
@@ -62,6 +87,7 @@ object FrameworkInstanceId {
         if (value.isEmpty()) return null
         val parts = value.split(DELIMITER)
         if (parts.size != FIELD_COUNT) return null
+        if (parts[1] == BINDER_MARKER) return createBinder(parts[0], parts[2])
         return create(parts[0], parts[1], parts[2])
     }
 

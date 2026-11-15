@@ -282,8 +282,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         val saved = handle
         // The privileged reader also reaches the kernel boot id when the app
         // side read is denied; a framework-only restart keeps it unchanged.
-        val liveBoot = AppSettings.currentBootId()
-            ?: FrameworkInstanceId.bootIdOf(info.frameworkId)
+        val liveBoot = currentMigrationBootId(AppSettings.currentBootId(), info.frameworkId)
         if (saved != null && saved.diskId == info.diskId && saved.isUnresolved &&
             saved.hasRebooted(liveBoot)
         ) {
@@ -528,7 +527,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         val h = handle ?: return
         // The reboot proof is re-read here from the live kernel id, so no caller
         // can release a source match without a confirmed new boot.
-        val rebooted = rebootRecovery && h.hasRebooted(AppSettings.currentBootId())
+        val rebooted = rebootRecovery && h.hasRebooted(liveKernelBootId())
         if (rebootRecovery && !rebooted) return
         setStateText(R.string.migration_status_checking, R.color.color_muted)
         manager.requestMigrationOverview(h.diskId) { info, error ->
@@ -545,6 +544,16 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
                 markUnverified(cardChanged = true)
                 return@requestMigrationOverview
             }
+            // The preflight proof may have used an older overview; the fresh
+            // answer carries its own privileged framework identity, so a real
+            // reboot must be proved again before anything is settled.
+            val freshRebooted = rebootRecovery && h.hasRebooted(
+                currentMigrationBootId(AppSettings.currentBootId(), info.frameworkId),
+            )
+            if (rebootRecovery && !freshRebooted) {
+                markUnverified(cardChanged = false)
+                return@requestMigrationOverview
+            }
             val actual = if (h.kind == ShizukuManager.KIND_PRIMARY) {
                 info.primaryUuid
             } else {
@@ -552,7 +561,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
             }
             if (destinationMatches(actual, h.targetUuid)) {
                 markCompletedVerified()
-            } else if (rebooted && h.sourceUuid.isNotBlank() &&
+            } else if (freshRebooted && h.sourceUuid.isNotBlank() &&
                 actual != null && destinationMatches(actual, h.sourceUuid)
             ) {
                 // The reboot ended the old move and the location is still the
@@ -754,15 +763,22 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
             }
             // The native reply names the instance that issued the id; an reply
             // without one keeps the request unverified instead of pollable.
+            val provenFrameworkId = FrameworkInstanceId.canonical(status.frameworkId)
+            if (provenFrameworkId != null) {
+                // ownedMoveId() reads only the cached overview, which may
+                // predate this start; a canonical native proof fills it in
+                // before polling without stamping any disk-loaded handle.
+                overview = overview?.copy(frameworkId = provenFrameworkId)
+            }
             val running = saved.copy(
                 moveId = status.moveId,
                 state = status.state,
-                frameworkId = status.frameworkId,
+                frameworkId = provenFrameworkId,
             )
             adoptHandle(running)
             lastProgress = status.progress
             setKeepScreenOn(true)
-            manager.startMigrationPolling(status.moveId, status.frameworkId)
+            manager.startMigrationPolling(status.moveId, provenFrameworkId)
             render()
         }
     }
@@ -1198,7 +1214,7 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
      * framework-only restart keeps that UUID, so it never becomes reboot proof.
      */
     private fun liveKernelBootId(): String? =
-        AppSettings.currentBootId() ?: FrameworkInstanceId.bootIdOf(overview?.frameworkId)
+        currentMigrationBootId(AppSettings.currentBootId(), overview?.frameworkId)
 
     /** The framework instance named by the latest privileged overview. */
     private fun overviewFrameworkId(): String? = overview?.frameworkId
