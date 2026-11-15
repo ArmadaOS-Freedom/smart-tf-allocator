@@ -39,6 +39,23 @@ object MoveStatusDecoder {
     }
 
     /**
+     * The single active move id after [status] was decoded for [moveId].
+     *
+     * An in-progress move claims a free slot. A terminal status releases only
+     * its own move; an unrelated active id is preserved, so a resumed or
+     * secondary move can never clear the task that is really running.
+     */
+    fun activeMoveIdAfter(
+        activeMoveId: Int?,
+        moveId: Int,
+        status: MoveStatus,
+    ): Int? = when (status) {
+        is MoveStatus.InProgress -> activeMoveId ?: moveId
+        MoveStatus.Complete -> if (activeMoveId == moveId) null else activeMoveId
+        is MoveStatus.Failed -> if (activeMoveId == moveId) null else activeMoveId
+    }
+
+    /**
      * Names the platform's `PackageManager` move failure codes.
      *
      * Every value `>= 0` is active progress and `-100` is completion; every

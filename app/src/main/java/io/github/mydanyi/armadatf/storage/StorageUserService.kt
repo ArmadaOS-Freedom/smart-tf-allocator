@@ -10,15 +10,18 @@ import io.github.mydanyi.armadatf.domain.CardIdentity
 import io.github.mydanyi.armadatf.domain.CardLayout
 import io.github.mydanyi.armadatf.domain.CardLayoutPolicy
 import io.github.mydanyi.armadatf.domain.DiskSnapshot
+import io.github.mydanyi.armadatf.domain.FrameworkInstanceId
 import io.github.mydanyi.armadatf.domain.Identifiers
 import io.github.mydanyi.armadatf.domain.InstalledApp
 import io.github.mydanyi.armadatf.domain.MigrationErrors
+import io.github.mydanyi.armadatf.domain.MigrationInventoryPaging
 import io.github.mydanyi.armadatf.domain.MigrationKind
 import io.github.mydanyi.armadatf.domain.MigrationPolicy
 import io.github.mydanyi.armadatf.domain.MigrationRequest
 import io.github.mydanyi.armadatf.domain.MoveStatus
 import io.github.mydanyi.armadatf.domain.MoveStatusDecoder
 import io.github.mydanyi.armadatf.domain.PlatformPaths
+import io.github.mydanyi.armadatf.domain.RepartitionPolicy
 import io.github.mydanyi.armadatf.domain.VolumeUuids
 import org.json.JSONArray
 import org.json.JSONObject
@@ -105,6 +108,16 @@ class StorageUserService : IStorageService.Stub() {
 
     /** Move id of the migration that is still running, if any. */
     private var migrationActiveMoveId: Int? = null
+
+    /** Latest frozen inventory; a new summary replaces it and stale tokens fail. */
+    private var inventorySnapshot: InventorySnapshot? = null
+
+    /** Immutable inventory rows captured by one [migrationInfo] summary. */
+    private data class InventorySnapshot(
+        val token: String,
+        val userId: Int,
+        val rows: List<String>,
+    )
 
     // --- AIDL entry points ---------------------------------------------------
 
@@ -320,6 +333,11 @@ class StorageUserService : IStorageService.Stub() {
     override fun migrationInfo(diskId: String): String {
         val userId = userIdForCaller(Binder.getCallingUid())
         synchronized(lock) {
+            // A new summary replaces the previous snapshot; an old token is stale.
+            inventorySnapshot = null
+            // The framework instance that owns numeric move ids right now.
+            // The UI needs it before it may adopt any retained id.
+            val frameworkId = nativeMigration.currentFrameworkId()
             try {
                 val disk = nativeStorage.disks().firstOrNull { it.id == diskId }
                     ?: return failString(
@@ -350,41 +368,54 @@ class StorageUserService : IStorageService.Stub() {
                     volumesArray.put(volumeJson(volume))
                 }
 
-                val appsArray = JSONArray()
+                val appRows = ArrayList<String>()
                 var appsError: String? = null
-                var appsTruncated = false
-                var anyAppOnCard = false
+                var moveBackRequired: Boolean? = null
                 val cardReady = isUsablePrivateTarget(card.privateVolume)
-                if (selected != null) {
+                val privateFsUuids = volumes
+                    .filter { it.diskId == diskId && it.type == TYPE_PRIVATE }
+                    .map { it.fsUuid }
+                val identityRefusal = RepartitionPolicy.privateIdentityRefusal(privateFsUuids)
+                if (identityRefusal != null) {
+                    // Unknown private identity: neither the caller inventory nor
+                    // the all-user occupancy can be verified.
+                    appsError = identityRefusal
+                    log(LEVEL_WARN, "migration_info_apps", appsError)
+                } else if (privateFsUuids.isEmpty()) {
+                    // No adoptable private volume: nothing on the card to move back.
+                    moveBackRequired = false
+                } else {
+                    if (selected != null) {
+                        appsError = buildInventory(appRows, userId, selected, cardReady)
+                    }
+                    // The summary spans every Android profile and includes
+                    // system apps, while the inventory above stays user-scoped.
                     try {
-                        val installed = nativeMigration.installedApps(userId)
-                            .sortedBy { it.packageName }
-                        // Visibility is decided by the pure policy alone: an
-                        // installed user app stays listed on whatever volume it
-                        // occupies, so a completed move never hides it. The
-                        // admin read stays per row below; it is not needed to
-                        // decide visibility.
-                        val visible = installed.filter {
-                            MigrationPolicy.visibleInInventory(
-                                it.toInstalledApp(isDeviceAdmin = null),
-                                selected,
-                            )
-                        }
-                        appsTruncated = visible.size > MAX_MIGRATION_APPS
-                        // Full detection over every installed app, so a card
-                        // that still holds any app is never reported as empty.
-                        anyAppOnCard = installed.any { onSelectedCard(it, selected) }
-                        for (snapshot in visible.take(MAX_MIGRATION_APPS)) {
-                            val app = snapshot.toInstalledApp(
-                                nativeMigration.isDeviceAdmin(snapshot.packageName, userId),
-                            )
-                            val onCard = MigrationPolicy.isOnSelectedCard(app, selected)
-                            appsArray.put(appJson(app, selected, onCard, cardReady))
-                        }
+                        val allApps = nativeMigration.installedAppsAllUsers(userId)
+                        val sources = allApps.values.asSequence()
+                            .flatten()
+                            .map { it.sourceUuid }
+                            .toList()
+                        moveBackRequired = RepartitionPolicy.occupancyRefusal(
+                            RepartitionPolicy.privateUuids(privateFsUuids),
+                            primaryRaw,
+                            sources,
+                        ) != null
                     } catch (e: Exception) {
-                        appsError = classify(e)
+                        if (appsError == null) appsError = classify(e)
                         log(LEVEL_WARN, "migration_info_apps", appsError)
                     }
+                }
+
+                var appsToken: String? = null
+                if (appsError == null && selected != null) {
+                    val token = UUID.randomUUID().toString()
+                    appsToken = token
+                    inventorySnapshot = InventorySnapshot(
+                        token = token,
+                        userId = userId,
+                        rows = appRows.toList(),
+                    )
                 }
 
                 val data = JSONObject()
@@ -405,12 +436,16 @@ class StorageUserService : IStorageService.Stub() {
                         if (appsError != null) {
                             JSONObject.NULL
                         } else {
-                            primaryOnThisDisk || anyAppOnCard
+                            moveBackRequired ?: false
                         },
                     )
                     .put("volumes", volumesArray)
-                    .put("apps", appsArray)
-                    .put("apps_truncated", appsTruncated)
+                    .put("apps", JSONArray())
+                    .put("apps_token", appsToken ?: JSONObject.NULL)
+                    .put("apps_count", if (appsError == null) appRows.size else 0)
+                    .put("apps_page_size", MigrationInventoryPaging.MAX_ROWS_PER_PAGE)
+                    .put("apps_truncated", false)
+                    .put("framework_id", frameworkId ?: JSONObject.NULL)
                 if (appsError != null) data.put("apps_error", appsError)
                 val active = migrationRecords.values.lastOrNull()
                 if (active != null) data.put("active_migration", recordJson(active))
@@ -418,6 +453,46 @@ class StorageUserService : IStorageService.Stub() {
             } catch (e: Exception) {
                 return fail(classify(e), e)
             }
+        }
+    }
+
+    override fun migrationAppsPage(token: String, offset: Int, limit: Int): String {
+        val userId = userIdForCaller(Binder.getCallingUid())
+        synchronized(lock) {
+            val snapshot = inventorySnapshot
+            if (snapshot == null || snapshot.token != token) {
+                return failString(ERR_INVALID_TOKEN, "inventory snapshot token is stale")
+            }
+            if (snapshot.userId != userId) {
+                return failString(
+                    ERR_PERMISSION_DENIED,
+                    "the inventory snapshot belongs to another user",
+                )
+            }
+            val page = try {
+                MigrationInventoryPaging.page(snapshot.rows, offset, limit)
+            } catch (e: MigrationInventoryPaging.InvalidPageException) {
+                return failString(ERR_INVALID_REQUEST, e.message)
+            } catch (e: MigrationInventoryPaging.OversizedRowException) {
+                return failString(ERR_REPLY_TOO_LARGE, e.message)
+            }
+            val apps = JSONArray()
+            for (row in page.rows) apps.put(JSONObject(row))
+            val reply = ok(
+                JSONObject()
+                    .put("token", snapshot.token)
+                    .put("offset", page.offset)
+                    .put("total", page.total)
+                    .put("next_offset", page.nextOffset)
+                    .put("apps", apps),
+            )
+            if (!MigrationInventoryPaging.fitsReply(reply)) {
+                return failString(
+                    ERR_REPLY_TOO_LARGE,
+                    "the inventory page exceeds the binder reply budget",
+                )
+            }
+            return reply
         }
     }
 
@@ -688,6 +763,20 @@ class StorageUserService : IStorageService.Stub() {
                     }
                 }
 
+                // The instance must be known BEFORE the native call: the
+                // numeric id it returns is only meaningful inside it.
+                val identityBefore = nativeMigration.currentFrameworkId()
+                    ?: throw MigrationRejectedException(
+                        ERR_FRAMEWORK_IDENTITY_UNAVAILABLE,
+                        "the running framework instance could not be identified",
+                    )
+                // A terminal record from an earlier request must never stand in
+                // for the move about to start. Running records stay: they are
+                // unresolved and still describe a live native task.
+                migrationRecords.entries.removeAll { entry ->
+                    entry.value.state == STATE_MIGRATION_COMPLETED ||
+                        entry.value.state == STATE_MIGRATION_FAILED
+                }
                 val moveId = when (pending.request.kind) {
                     MigrationKind.PRIMARY ->
                         nativeMigration.movePrimaryStorage(pending.targetNativeUuid)
@@ -697,14 +786,32 @@ class StorageUserService : IStorageService.Stub() {
                     )
                 }
                 if (moveId < 0) {
+                    // A framework restart during the call renumbers moves, so
+                    // the instance is re-read and only an unchanged one may
+                    // attribute this refusal.
+                    val identityAfter = nativeMigration.currentFrameworkId()
+                    if (!FrameworkInstanceId.matches(identityBefore, identityAfter)) {
+                        // A refusal after an instance change cannot be
+                        // attributed to the instance that issued the id: keep
+                        // the request unresolved instead of a native failure.
+                        throw MigrationRejectedException(
+                            ERR_MOVE_IDENTITY_UNVERIFIED,
+                            "the framework instance changed during the start call",
+                        )
+                    }
                     throw MigrationRejectedException(
                         ERR_MOVE_START_FAILED,
                         "the platform rejected the move (status $moveId)",
                     )
                 }
 
+                // Retain the successful move and claim the busy slot before the
+                // post-start read, so an ambiguous observation can never lose
+                // the request or let older metadata answer for it.
                 val record = MigrationRecord(
                     moveId = moveId,
+                    // Proven only after the same instance is observed below.
+                    frameworkId = null,
                     request = pending.request,
                     userId = pending.userId,
                     state = STATE_MIGRATION_RUNNING,
@@ -716,13 +823,24 @@ class StorageUserService : IStorageService.Stub() {
                 migrationRecords[moveId] = record
                 migrationActiveMoveId = moveId
                 trimMigrationRecords()
+
+                // Only now prove the origin; a matching instance replaces the
+                // record with its canonical id, otherwise it stays unresolved.
+                val identityAfter = nativeMigration.currentFrameworkId()
+                val retained = if (FrameworkInstanceId.matches(identityBefore, identityAfter)) {
+                    record.copy(frameworkId = identityBefore).also {
+                        migrationRecords[moveId] = it
+                    }
+                } else {
+                    record
+                }
                 log(
                     LEVEL_INFO,
                     "start_migration",
                     "kind=${pending.request.kind.jsonName} disk=${pending.request.diskId} " +
                         "target=${pending.request.targetUuid} move=$moveId",
                 )
-                return ok(recordJson(record))
+                return ok(recordJson(retained))
             } catch (e: MigrationRejectedException) {
                 log(LEVEL_WARN, "start_migration", e.code)
                 return failString(e.code, e.message)
@@ -732,26 +850,61 @@ class StorageUserService : IStorageService.Stub() {
         }
     }
 
-    override fun migrationStatus(moveId: Int): String {
+    override fun migrationStatus(moveId: Int, expectedFrameworkId: String?): String {
         synchronized(lock) {
+            // A numeric id is only meaningful inside the framework instance
+            // that issued it, so the caller names its expected instance. The
+            // check happens before the native lookup: a foreign id can neither
+            // mutate a record nor touch the busy slot.
+            val expected = FrameworkInstanceId.canonical(expectedFrameworkId)
+            if (expected == null ||
+                !FrameworkInstanceId.matches(expected, nativeMigration.currentFrameworkId())
+            ) {
+                return failString(
+                    ERR_MOVE_IDENTITY_UNVERIFIED,
+                    MOVE_IDENTITY_UNVERIFIED_DETAIL,
+                )
+            }
             val nativeStatus = try {
                 nativeMigration.moveStatus(moveId)
             } catch (e: Exception) {
                 return fail(classify(e), e)
             }
+            // Re-check after the privileged call: a framework restart in
+            // between would make the numeric answer belong to another
+            // namespace, so nothing may change in that case.
+            if (!FrameworkInstanceId.matches(expected, nativeMigration.currentFrameworkId())) {
+                return failString(
+                    ERR_MOVE_IDENTITY_UNVERIFIED,
+                    MOVE_IDENTITY_UNVERIFIED_DETAIL,
+                )
+            }
             val record = migrationRecords[moveId]
+            if (record != null &&
+                !FrameworkInstanceId.matches(expected, record.frameworkId)
+            ) {
+                // A record created in another instance must never be settled by
+                // this instance's numbers.
+                return failString(
+                    ERR_MOVE_IDENTITY_UNVERIFIED,
+                    MOVE_IDENTITY_UNVERIFIED_DETAIL,
+                )
+            }
             val decoded = MoveStatusDecoder.decode(nativeStatus)
             if (record == null) {
+                // A native terminal status releases only its own move, while an
+                // in-progress resume claims a free slot.
+                migrationActiveMoveId = MoveStatusDecoder.activeMoveIdAfter(
+                    migrationActiveMoveId,
+                    moveId,
+                    decoded,
+                )
                 return when (decoded) {
                     is MoveStatus.InProgress -> {
-                        // A resumed move has no retained request in this process,
-                        // but it is still running natively: keep its id so a new
-                        // startMigration stays blocked instead of reallocating
-                        // under the active move.
-                        if (migrationActiveMoveId == null) migrationActiveMoveId = moveId
                         ok(
                             statusJson(
                                 moveId = moveId,
+                                frameworkId = expected,
                                 state = STATE_MIGRATION_RUNNING,
                                 progress = decoded.percent,
                                 nativeStatus = nativeStatus,
@@ -770,6 +923,7 @@ class StorageUserService : IStorageService.Stub() {
                     is MoveStatus.Failed -> ok(
                         statusJson(
                             moveId = moveId,
+                            frameworkId = expected,
                             state = STATE_MIGRATION_FAILED,
                             progress = null,
                             nativeStatus = nativeStatus,
@@ -831,6 +985,7 @@ class StorageUserService : IStorageService.Stub() {
             pendingMigration = null
             migrationRecords.clear()
             migrationActiveMoveId = null
+            inventorySnapshot = null
             handoff = null
             state = STATE_IDLE
             phase = null
@@ -1097,6 +1252,8 @@ class StorageUserService : IStorageService.Stub() {
     /** Retained platform move handle and the request needed to verify it. */
     private data class MigrationRecord(
         val moveId: Int,
+        /** Canonical framework instance that issued [moveId]; `null` if unproven. */
+        val frameworkId: String?,
         val request: MigrationRequest,
         val userId: Int,
         val state: String,
@@ -1197,6 +1354,7 @@ class StorageUserService : IStorageService.Stub() {
 
     private fun recordJson(record: MigrationRecord): JSONObject = statusJson(
         moveId = record.moveId,
+        frameworkId = record.frameworkId,
         state = record.state,
         progress = record.progress,
         nativeStatus = record.nativeStatus,
@@ -1209,6 +1367,7 @@ class StorageUserService : IStorageService.Stub() {
 
     private fun statusJson(
         moveId: Int,
+        frameworkId: String?,
         state: String,
         progress: Int?,
         nativeStatus: Int?,
@@ -1219,6 +1378,7 @@ class StorageUserService : IStorageService.Stub() {
         detail: String?,
     ): JSONObject = JSONObject()
         .put("move_id", moveId)
+        .put("framework_id", frameworkId ?: JSONObject.NULL)
         .put("state", state)
         .put("progress", progress ?: JSONObject.NULL)
         .put("native_status", nativeStatus ?: JSONObject.NULL)
@@ -1351,42 +1511,77 @@ class StorageUserService : IStorageService.Stub() {
         sizeBytes = null,
     )
 
-    private fun onSelectedCard(
-        snapshot: NativeMigration.PackageSnapshot,
-        selectedPrivateUuid: String,
-    ): Boolean = VolumeUuids.same(snapshot.sourceUuid, selectedPrivateUuid)
+    /**
+     * Fills [appsRows] with every visible application of [userId], sorted by
+     * package name. There is no length cap: a card occupant later in the
+     * alphabet must stay reachable and movable back.
+     *
+     * @return `null` on success, otherwise the stable error code to report.
+     */
+    private fun buildInventory(
+        appsRows: MutableList<String>,
+        userId: Int,
+        selected: String,
+        cardReady: Boolean,
+    ): String? = try {
+        val installed = nativeMigration.installedApps(userId)
+        val inventory = MigrationPolicy.inventoryApps(
+            installed.map { it.toInstalledApp(isDeviceAdmin = null) },
+            selected,
+        )
+        for (app in inventory) {
+            val row = app.copy(
+                isDeviceAdmin = nativeMigration.isDeviceAdmin(app.packageName, userId),
+            )
+            val onCard = MigrationPolicy.isOnSelectedCard(row, selected)
+            appsRows.add(appJson(row, selected, onCard, cardReady).toString())
+        }
+        null
+    } catch (e: Exception) {
+        classify(e)
+    }
 
     /**
      * Refuses to format a card that still carries the device's primary storage
-     * or any installed application. Returns [ERR_MOVE_BACK_REQUIRED] when the
-     * card is still in use, `null` when it is safe.
+     * or an installed application of ANY Android user/profile.
+     *
+     * Private volume identities are verified first: an unreadable UUID makes
+     * occupancy unverifiable, so formatting is refused before any occupancy
+     * query. Applications are swept for every reported user and are NOT
+     * filtered like the inventory: a system app or another profile's app still
+     * protects the card. Package query failures stay refusals, never empty.
      */
     private fun moveBackBlocked(
         diskId: String,
         volumes: List<NativeStorage.VolumeSnapshot>,
         userId: Int,
     ): String? {
-        val privateVolumes = volumes.filter { it.diskId == diskId && it.type == TYPE_PRIVATE }
-        if (privateVolumes.isEmpty()) return null
-        val privateUuids = privateVolumes.mapNotNull { Identifiers.normalizeUuid(it.fsUuid) }.toSet()
+        val privateFsUuids = volumes
+            .filter { it.diskId == diskId && it.type == TYPE_PRIVATE }
+            .map { it.fsUuid }
+        RepartitionPolicy.privateIdentityRefusal(privateFsUuids)?.let { code ->
+            throw MigrationRejectedException(
+                code,
+                "the card's private volume identifiers could not be verified",
+            )
+        }
+        val privateUuids = RepartitionPolicy.privateUuids(privateFsUuids)
         if (privateUuids.isEmpty()) return null
-        val primary = Identifiers.normalizeUuid(nativeMigration.primaryStorageUuid(userId))
-        if (primary != null && primary in privateUuids) return ERR_MOVE_BACK_REQUIRED
-        val apps = try {
-            nativeMigration.installedApps(userId)
+        val primary = nativeMigration.primaryStorageUuid(userId)
+        RepartitionPolicy.occupancyRefusal(privateUuids, primary, emptyList())
+            ?.let { return it }
+        val allApps = try {
+            nativeMigration.installedAppsAllUsers(userId)
         } catch (e: SecurityException) {
             throw e
         } catch (e: Exception) {
             throw MigrationRejectedException(
                 MigrationErrors.APP_QUERY_UNAVAILABLE,
-                "installed applications could not be read",
+                "installed applications could not be read for every Android user",
             )
         }
-        val onCard = apps.any { snapshot ->
-            val source = Identifiers.normalizeUuid(snapshot.sourceUuid)
-            source != null && source in privateUuids
-        }
-        return if (onCard) ERR_MOVE_BACK_REQUIRED else null
+        val sources = allApps.values.asSequence().flatten().map { it.sourceUuid }.toList()
+        return RepartitionPolicy.occupancyRefusal(privateUuids, primary, sources)
     }
 
     /**
@@ -1504,13 +1699,16 @@ class StorageUserService : IStorageService.Stub() {
         const val ERR_INTERRUPTED = "verification_interrupted"
         const val ERR_INTERNAL = "internal_error"
 
-        /** Partition refused because the card still holds primary storage/apps. */
-        const val ERR_MOVE_BACK_REQUIRED = "move_back_required"
         const val ERR_NATIVE_MIGRATION_UNAVAILABLE = "native_migration_unavailable"
         const val ERR_NO_MIGRATION_PLAN = "no_migration_plan"
         const val ERR_MOVE_START_FAILED = "move_start_failed"
+        const val ERR_FRAMEWORK_IDENTITY_UNAVAILABLE = "framework_identity_unavailable"
+        const val ERR_MOVE_IDENTITY_UNVERIFIED = "move_identity_unverified"
+        const val MOVE_IDENTITY_UNVERIFIED_DETAIL =
+            "the move id does not belong to the running framework instance"
         const val ERR_DESTINATION_MISMATCH = "destination_mismatch"
         const val ERR_DESTINATION_UNVERIFIED = "destination_unverified"
+        const val ERR_REPLY_TOO_LARGE = "reply_too_large"
 
         const val STATE_MIGRATION_RUNNING = "running"
         const val STATE_MIGRATION_COMPLETED = "completed"
@@ -1533,7 +1731,6 @@ class StorageUserService : IStorageService.Stub() {
         const val STATE_BAD_REMOVAL = 7
         const val STATE_REMOVED = 8
 
-        const val MAX_MIGRATION_APPS = 300
         const val MAX_RETAINED_MOVES = 8
 
         const val ERASE_SCOPE = "entire_tf_card"

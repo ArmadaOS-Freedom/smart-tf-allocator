@@ -46,10 +46,13 @@ class HandoffWriter(context: Context) {
     fun write(handoff: JSONObject): File {
         val validated = validate(handoff)
         val payload = encode(validated.canonical)
-        // Persist the private pending copy BEFORE attempting the TF write so a
-        // later failure is retryable without repartitioning.
-        atomicWrite(pendingFile(), payload)
-        return publish(payload, validated.publicFsUuid)
+        // Pending write and publication are serialised under the shared lock so
+        // no other writer can slip a different handoff into the gap. A failed
+        // publication leaves the pending copy in place for [retry].
+        return synchronized(PENDING_LOCK) {
+            atomicWrite(pendingFile(), payload)
+            publish(payload, validated.publicFsUuid)
+        }
     }
 
     /**
@@ -60,11 +63,41 @@ class HandoffWriter(context: Context) {
      * @throws HandoffException `handoff_invalid` when no valid pending copy
      * exists, `public_volume_missing`/`handoff_write_failed` as in [write].
      */
-    fun retry(): File {
+    fun retry(): File = synchronized(PENDING_LOCK) {
         val bytes = readPendingBytes()
             ?: throw HandoffException(ERR_HANDOFF_INVALID, "no pending handoff to retry")
         val validated = parsePayload(bytes)
-        return publish(bytes, validated.publicFsUuid)
+        publish(bytes, validated.publicFsUuid)
+    }
+
+    /**
+     * Re-publishes the stored private pending payload only while it is still
+     * exactly [expected].
+     *
+     * Returns `null` when a newer pending copy has replaced it: an older
+     * recovery must never publish, or later delete, data that belongs to a
+     * different handoff, and `null` once the pending copy is already gone
+     * (superseded or completed). The default no-argument [retry] keeps its
+     * original missing-file error for callers that hold no captured payload.
+     */
+    fun retryExpected(expected: JSONObject): File? {
+        val validated = validate(expected)
+        val expectedBytes = encode(validated.canonical)
+        val publicFsUuid = validated.publicFsUuid
+        // Read, validate, compare and publish stay inside the shared lock: a
+        // corrupt pending copy still throws instead of looking superseded, and
+        // an exact byte match makes the pre-helper public_fs_uuid authoritative.
+        return publishExpectedHandoff(
+            PENDING_LOCK,
+            expectedBytes,
+            {
+                val bytes = readPendingBytes()
+                if (bytes != null) parsePayload(bytes)
+                bytes
+            },
+        ) { bytes ->
+            publish(bytes, publicFsUuid)
+        }
     }
 
     /**
@@ -76,10 +109,22 @@ class HandoffWriter(context: Context) {
      * missing file already counts as cleared; a failed delete returns `false`
      * so the caller can log it without pretending a Linux handoff is valid.
      */
-    fun clearPending(): Boolean {
+    fun clearPending(expected: JSONObject? = null): Boolean = synchronized(PENDING_LOCK) {
         val file = pendingFile()
-        if (!file.exists()) return true
-        return try {
+        if (!file.exists()) return@synchronized true
+        if (expected != null) {
+            // Compare-delete under the shared lock: a newer pending copy belongs
+            // to its own publication and must survive an older cleanup.
+            val current = try {
+                file.readBytes()
+            } catch (e: IOException) {
+                throw HandoffException(ERR_HANDOFF_INVALID, "pending handoff unreadable")
+            }
+            if (!current.contentEquals(encode(validate(expected).canonical))) {
+                return@synchronized false
+            }
+        }
+        try {
             file.delete()
         } catch (e: SecurityException) {
             false
@@ -95,6 +140,45 @@ class HandoffWriter(context: Context) {
         val bytes = readPendingBytes() ?: return null
         val validated = parsePayload(bytes)
         return JSONObject(validated.canonical.toString())
+    }
+
+    /**
+     * Returns true when the private pending payload is already present and
+     * intact at its matching app-specific public destination.
+     *
+     * v0.3 intentionally kept the pending copy after a successful publication;
+     * a later recovery must recognise that cached copy as success instead of
+     * republishing it or reporting a false failure. A missing/unmounted card
+     * and any IO problem answer `false`, so recovery falls back to [retry] and
+     * surfaces the normal `public_volume_missing`/`handoff_write_failed` error.
+     */
+    fun pendingIsPublished(expected: JSONObject? = null): Boolean {
+        // An explicit expected payload is verified on its own: another writer
+        // may already have cleared the matching pending file after publishing
+        // exactly this payload. Only the no-argument form depends on the
+        // pending copy still being present.
+        val validated = if (expected != null) {
+            validate(expected)
+        } else {
+            val bytes = readPendingBytes() ?: return false
+            parsePayload(bytes)
+        }
+        val canonical = encode(validated.canonical)
+        val dir = try {
+            findPublicVolumeDir(validated.publicFsUuid)
+        } catch (e: HandoffException) {
+            return false
+        }
+        val target = File(dir, FILE_NAME)
+        if (!target.exists()) return false
+        if (target.length() > MAX_BYTES) return false
+        val published = try {
+            target.readBytes()
+        } catch (e: IOException) {
+            return false
+        }
+        if (!published.contentEquals(canonical)) return false
+        return volumeUuidMatches(dir, validated.publicFsUuid)
     }
 
     // --- publishing ----------------------------------------------------------
@@ -162,13 +246,13 @@ class HandoffWriter(context: Context) {
 
     private fun pendingFile(): File = File(appContext.filesDir, PENDING_FILE_NAME)
 
-    private fun readPendingBytes(): ByteArray? {
+    private fun readPendingBytes(): ByteArray? = synchronized(PENDING_LOCK) {
         val file = pendingFile()
-        if (!file.exists()) return null
+        if (!file.exists()) return@synchronized null
         if (file.length() > MAX_BYTES) {
             throw HandoffException(ERR_HANDOFF_INVALID, "pending handoff exceeds size limit")
         }
-        return try {
+        try {
             file.readBytes()
         } catch (e: IOException) {
             throw HandoffException(ERR_HANDOFF_INVALID, "pending handoff unreadable")
@@ -374,6 +458,12 @@ class HandoffWriter(context: Context) {
         throw HandoffException(ERR_HANDOFF_INVALID, "invalid handoff field: $field")
 
     private companion object {
+        /**
+         * Serialises pending-file write, read and compare-delete across every
+         * writer instance in this process. No framework or schema involved.
+         */
+        val PENDING_LOCK = Any()
+
         const val MAGIC = "armada-tf-handoff"
 
         /** Mixed handoff schema, unchanged. */

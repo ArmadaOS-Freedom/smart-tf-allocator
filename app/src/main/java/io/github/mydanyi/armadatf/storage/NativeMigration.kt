@@ -1,9 +1,14 @@
 package io.github.mydanyi.armadatf.storage
 
+import android.annotation.SuppressLint
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.os.StatFs
+import io.github.mydanyi.armadatf.domain.BinderFrameworkIdentity
+import io.github.mydanyi.armadatf.domain.FrameworkInstanceId
 import io.github.mydanyi.armadatf.domain.Identifiers
+import java.io.File
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 
@@ -41,6 +46,12 @@ class NativeMigration(
 ) {
 
     /**
+     * Per-instance witness of the live package-service binder, used only on
+     * releases that do not publish the system-server tuple (Android 8).
+     */
+    private val binderIdentity = BinderFrameworkIdentity()
+
+    /**
      * Current primary-storage UUID; `null` means internal storage.
      *
      * [userId] is kept for the existing service callers, but
@@ -71,6 +82,67 @@ class NativeMigration(
     fun moveStatus(moveId: Int): Int = privileged {
         (callPackage("getMoveStatus", arrayOf(INT), moveId) as? Number)?.toInt()
             ?: throw NativeMigrationException("getMoveStatus did not return a status")
+    }
+
+    /**
+     * Canonical identity of the framework instance running right now, or `null`
+     * when it cannot be read.
+     *
+     * `PackageManagerService` is rebuilt on every framework-only restart and
+     * numbers its native moves from 0 again, while the kernel boot id does not
+     * change. `SystemServer` therefore publishes its own start count and start
+     * time before the package manager is bootstrapped; both are read here
+     * through the same privileged reflection path the native moves already use,
+     * together with the kernel boot id.
+     *
+     * Android 8 does not publish those properties. There the running package
+     * service binder is held and observed instead: the binder object is
+     * recreated with the framework, so one live binder on one kernel boot is
+     * the same witness without any system property.
+     *
+     * A denied or unavailable read yields `null` instead of a default, and a
+     * count that changes between the property reads is refused as a mixed
+     * tuple. This is a correctness witness for the move-id namespace only; it
+     * is never proof that an old native task stopped. Only a real kernel boot
+     * change proves that.
+     */
+    fun currentFrameworkId(): String? = try {
+        privileged {
+            val bootUuid = kernelBootUuid()
+            val count = systemProperty(PROP_START_COUNT)
+            val elapsed = systemProperty(PROP_START_ELAPSED)
+            // A restart between the reads would mix two instances; the count
+            // only ever grows, so an unchanged re-read keeps the tuple whole.
+            val recheck = systemProperty(PROP_START_COUNT)
+            if (count != recheck) return@privileged null
+            val numeric = count?.let { FrameworkInstanceId.create(bootUuid, it, elapsed) }
+            if (numeric != null) return@privileged numeric
+            // Android 8 does not publish the system-server tuple; the package
+            // service binder is recreated on every framework restart, so a
+            // live binder plus the kernel boot witness the instance instead.
+            if (FrameworkInstanceId.canonicalBootUuid(bootUuid) == null) {
+                return@privileged null
+            }
+            val binder = binderFor(SERVICE_PACKAGE) ?: return@privileged null
+            val alive = binder.isBinderAlive && binder.pingBinder()
+            binderIdentity.observe(bootUuid, binder, alive)
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun kernelBootUuid(): String? = try {
+        File(BOOT_ID_FILE).readText()
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun systemProperty(name: String): String? = try {
+        val getter = Class.forName(SYSTEM_PROPERTIES)
+            .getMethod("get", String::class.java)
+        invoke(getter, null, name) as? String
+    } catch (e: Exception) {
+        null
     }
 
     /**
@@ -112,16 +184,203 @@ class NativeMigration(
      * cannot be read.
      */
     fun installedApps(userId: Int): List<PackageSnapshot> = privileged {
-        val manager = systemService(SERVICE_PACKAGE, PACKAGE_INTERFACE)
+        installedAppsIn(userId, factoryCatalog.packages())
+    }
+
+    /**
+     * Installed applications for every reported Android user/profile, using a
+     * single factory-catalog read.
+     *
+     * The platform's `IUserManager.getUsers` is privileged metadata: a denied,
+     * empty or malformed list is rejected instead of quietly narrowing the
+     * sweep to the owner. [callerUserId] must be present in the list, so a
+     * platform quirk can never hide the caller's own occupancy. Package query
+     * failures propagate; they are never treated as an empty result.
+     */
+    fun installedAppsAllUsers(callerUserId: Int): Map<Int, List<PackageSnapshot>> =
+        privileged {
+            val users = userIdsIn()
+            val factoryPackages = factoryCatalog.packages()
+            allUsersPackages(users, callerUserId) { userId, flags ->
+                installedAppsIn(userId, factoryPackages, flags)
+            }
+        }
+
+    /**
+     * Enumerates every reported user once and keeps each user's packages.
+     *
+     * The calling user must be part of [users] (see [requireUserList]); any
+     * failure raised by [readUserApps] propagates and aborts the whole sweep.
+     * There is no fallback to the calling user, because a partial result cannot
+     * describe global occupancy. The read is injected so this orchestration
+     * stays host-testable without binder or Android stubs.
+     */
+    internal fun allUsersPackages(
+        users: List<Int>,
+        callerUserId: Int,
+        readUserApps: (Int, Long) -> List<PackageSnapshot>,
+    ): Map<Int, List<PackageSnapshot>> =
+        requireUserList(users, callerUserId).associateWith { userId ->
+            readUserApps(userId, MATCH_UNINSTALLED_PACKAGES)
+        }
+
+    // Runs only inside the Shizuku root/shell UserService, where non-SDK API
+    // restrictions do not apply. A reflective query failure still propagates,
+    // so occupancy remains blocked instead of silently narrowed.
+    @SuppressLint("SoonBlockedPrivateApi")
+    private fun installedAppsIn(
+        userId: Int,
+        factoryPackages: Set<String>,
+        flags: Long = 0L,
+    ): List<PackageSnapshot> {
+        val binder = binderFor(SERVICE_PACKAGE)
+            ?: throw NativeMigrationException("IPackageManager service is not available")
         val method = installedApplicationsMethod()
             ?: throw NativeMigrationException(
                 "IPackageManager.getInstalledApplications is not available",
             )
-        val slice = invoke(method, manager, flagsArgument(method, 0), userId)
-        val factoryPackages = factoryCatalog.packages()
-        parceledList(slice).mapNotNull { info ->
-            info?.let { toPackageSnapshot(it, factoryPackages) }
+        val transactionCode = try {
+            Class.forName("$PACKAGE_INTERFACE\$Stub")
+                .getDeclaredField("TRANSACTION_getInstalledApplications")
+                .apply { isAccessible = true }
+                .getInt(null)
+        } catch (e: Exception) {
+            throw NativeMigrationException(
+                "IPackageManager.getInstalledApplications transaction is not available",
+                e,
+            )
         }
+        val entries = CompleteApplicationQuery.read(
+            binder = binder,
+            transactionCode = transactionCode,
+            flags = flags,
+            longFlags = method.parameterTypes[0] == Long::class.javaPrimitiveType,
+            userId = userId,
+            modernContinuation = Build.VERSION.SDK_INT >= 34,
+        )
+        val validated = if ((flags and MATCH_UNINSTALLED_PACKAGES) != 0L) {
+            occupancyApplicationEntries(entries)
+        } else {
+            applicationEntries(entries)
+        }
+        return validated.map { info ->
+            toPackageSnapshot(info, factoryPackages)
+        }
+    }
+
+    /**
+     * Validates one unwrapped `getInstalledApplications` result.
+     *
+     * A missing slice or list, or a `null` application entry, is unusable
+     * package metadata: the sweep is refused instead of dropping what could not
+     * be read, because a silently partial list understates global occupancy. A
+     * genuine, non-null empty list is a valid answer and is kept as such.
+     * Visible for the host-side list-validation test.
+     */
+    internal fun applicationEntries(entries: List<*>?): List<Any> {
+        val list = entries
+            ?: throw NativeMigrationException(
+                "IPackageManager.getInstalledApplications returned no application list",
+            )
+        return list.map { info ->
+            info ?: throw NativeMigrationException(
+                "IPackageManager.getInstalledApplications returned a null application",
+            )
+        }
+    }
+
+    /**
+     * Validates a broad `MATCH_UNINSTALLED_PACKAGES` result for occupancy.
+     *
+     * The broad query also returns uninstalled-but-retained records and hidden
+     * apps; only entries whose `ApplicationInfo.FLAG_INSTALLED` bit is set are
+     * installed for this user and kept. A null entry, or an entry whose flags
+     * cannot be read as a number, refuses the sweep: a silently partial list
+     * would understate occupancy and the destructive format guard could miss
+     * installed data. Visible for the host-side occupancy test.
+     */
+    internal fun occupancyApplicationEntries(entries: List<*>?): List<Any> {
+        val list = applicationEntries(entries)
+        return list.mapNotNull { info ->
+            val flags = optionalIntField(info, "flags")
+                ?: throw NativeMigrationException(
+                    "flags of ${info.javaClass.name} was not numeric",
+                )
+            info.takeIf { (flags and FLAG_INSTALLED) != 0 }
+        }
+    }
+
+    // --- Android users -------------------------------------------------------
+
+    private fun userIdsIn(): List<Int> {
+        val manager = systemService(SERVICE_USER, USER_INTERFACE)
+        val method = usersMethod()
+            ?: throw NativeMigrationException("IUserManager.getUsers is not available")
+        val users = invoke(method, manager, *userQueryArgs(method.parameterCount)) as? List<*>
+        return userIdsFromList(users)
+    }
+
+    /**
+     * Arguments for a supported `getUsers` arity. Every flag selects the
+     * inclusive form, so partial, dying and pre-created users are all returned.
+     * Visible for the host-side signature test.
+     */
+    internal fun userQueryArgs(parameterCount: Int): Array<Any?> = when (parameterCount) {
+        1, 2, 3 -> Array<Any?>(parameterCount) { false }
+        else -> throw NativeMigrationException(
+            "IUserManager.getUsers has unsupported arity $parameterCount",
+        )
+    }
+
+    /**
+     * Validates the `List<UserInfo>` returned by `getUsers`.
+     *
+     * An empty or null list is unusable metadata, not "no profiles": Android
+     * always has at least the owner. A null entry, a missing/non-numeric `id`
+     * or a negative id is rejected. Visible for the host-side mapping test.
+     */
+    internal fun userIdsFromList(users: List<*>?): List<Int> {
+        if (users.isNullOrEmpty()) {
+            throw NativeMigrationException("IUserManager.getUsers returned no users")
+        }
+        return users.map { user ->
+            val info = user
+                ?: throw NativeMigrationException("IUserManager.getUsers returned a null user")
+            val id = optionalIntField(info, "id")
+                ?: throw NativeMigrationException(
+                    "id of ${info.javaClass.name} was not numeric",
+                )
+            if (id < 0) {
+                throw NativeMigrationException("IUserManager.getUsers returned an invalid id")
+            }
+            id
+        }.distinct()
+    }
+
+    /**
+     * Requires the calling user to be part of the platform's user list; a list
+     * that omits the caller cannot describe global occupancy. Visible for the
+     * host-side rejection test.
+     */
+    internal fun requireUserList(users: List<Int>, callerUserId: Int): List<Int> {
+        if (callerUserId !in users) {
+            throw NativeMigrationException(
+                "IUserManager.getUsers did not report the calling user $callerUserId",
+            )
+        }
+        return users
+    }
+
+    private fun usersMethod(): Method? {
+        val candidates = classFor(USER_INTERFACE).methods.filter { method ->
+            method.name == "getUsers" &&
+                method.parameterCount in 1..3 &&
+                method.parameterTypes.all { it == Boolean::class.javaPrimitiveType }
+        }
+        // Android 15 has three booleans; older releases expose one or two.
+        return candidates.firstOrNull { it.parameterCount == 3 }
+            ?: candidates.firstOrNull { it.parameterCount == 2 }
+            ?: candidates.firstOrNull { it.parameterCount == 1 }
     }
 
     /** One package, or `null` when it is not installed for [userId]. */
@@ -377,19 +636,8 @@ class NativeMigration(
         }
     }
 
-    private fun flagsArgument(method: Method, index: Int): Any =
-        if (method.parameterTypes[index] == Long::class.javaPrimitiveType) 0L else 0
-
-    private fun parceledList(slice: Any?): List<*> {
-        if (slice == null) return emptyList<Any?>()
-        val getList = try {
-            Class.forName("android.content.pm.ParceledListSlice").getMethod("getList")
-        } catch (e: ReflectiveOperationException) {
-            throw NativeMigrationException("ParceledListSlice.getList is not available", e)
-        }
-        return invoke(getList, slice) as? List<*>
-            ?: throw NativeMigrationException("ParceledListSlice did not return a list")
-    }
+    private fun flagsArgument(method: Method, index: Int, flags: Long = 0L): Any =
+        if (method.parameterTypes[index] == Long::class.javaPrimitiveType) flags else flags.toInt()
 
     private fun asMoveId(value: Any?, method: String): Int =
         (value as? Number)?.toInt()
@@ -432,9 +680,23 @@ class NativeMigration(
     private companion object {
         const val SERVICE_MOUNT = "mount"
         const val SERVICE_PACKAGE = "package"
+        const val SERVICE_USER = "user"
 
         const val STORAGE_INTERFACE = "android.os.storage.IStorageManager"
         const val PACKAGE_INTERFACE = "android.content.pm.IPackageManager"
+        const val USER_INTERFACE = "android.os.IUserManager"
+
+        /** Kernel file carrying the boot UUID. */
+        const val BOOT_ID_FILE = "/proc/sys/kernel/random/boot_id"
+
+        /** Hidden platform property reader used for the system-server tuple. */
+        const val SYSTEM_PROPERTIES = "android.os.SystemProperties"
+
+        /** Framework restart counter published before PackageManager bootstrap. */
+        const val PROP_START_COUNT = "sys.system_server.start_count"
+
+        /** Milliseconds since that framework start. */
+        const val PROP_START_ELAPSED = "sys.system_server.start_elapsed"
 
         const val EXPAND_MARKER = "/mnt/expand/"
 
@@ -443,6 +705,12 @@ class NativeMigration(
 
         /** `ApplicationInfo.FLAG_UPDATED_SYSTEM_APP`. */
         const val FLAG_UPDATED_SYSTEM_APP = 1 shl 7
+
+        /** `ApplicationInfo.FLAG_INSTALLED`. */
+        const val FLAG_INSTALLED = 1 shl 23
+
+        /** `PackageManager.MATCH_UNINSTALLED_PACKAGES`. */
+        const val MATCH_UNINSTALLED_PACKAGES = 0x2000L
 
         /** `PackageManager.INSTALL_LOCATION_UNSPECIFIED`. */
         const val INSTALL_LOCATION_UNSPECIFIED = -1

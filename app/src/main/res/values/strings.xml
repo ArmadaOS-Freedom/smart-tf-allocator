@@ -177,10 +177,12 @@
     <string name="migration_status_progress_unknown">Moving… the system has not reported progress yet.</string>
     <string name="migration_status_completed">Move completed. The destination was verified.</string>
     <string name="migration_status_failed">Move failed: %1$s</string>
-    <string name="migration_status_unverified">The move finished, but the destination could not be verified. No success is assumed and nothing was restarted.</string>
+    <string name="migration_status_unverified">The move status is unconfirmed: no finished move has been proven here, and nothing was restarted.</string>
     <string name="migration_status_card_changed">The card changed or is no longer readable. A saved result cannot be applied to the current card.</string>
     <string name="migration_status_checking">Checking the saved move…</string>
     <string name="migration_status_pending">A move was started but its result is unknown. Nothing will be restarted automatically.</string>
+    <string name="migration_status_recovery_reboot">The system move status cannot be confirmed. Fully restart Android, then reopen this screen and refresh to check the card. No move will be retried automatically.</string>
+    <string name="migration_status_interrupted">The move ended after a restart and storage remains at its original location. No move was retried automatically.</string>
     <string name="migration_logs_label">Logs</string>
     <string name="migration_logs_empty">No migration events yet.</string>
     <string name="migration_err_insufficient_storage">There is not enough free space at the destination.</string>

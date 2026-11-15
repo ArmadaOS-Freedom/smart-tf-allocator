@@ -141,7 +141,16 @@ class MainActivity : Activity(), ShizukuManager.Callback {
 
     private var operationBusy = false
     private var handoffWriting = false
-    private var handoffReady = false
+    // Payload-bound completion/dedup; see [HandoffLifecycle].
+    private val handoffLifecycle = HandoffLifecycle()
+    // Newest payload selected for publication. A different payload supersedes
+    // an in-flight write instead of being dropped while that write runs.
+    private var handoffLatestKey: String? = null
+    // Payload whose last write failed; auto-scheduling must not loop on it.
+    private var handoffFailedKey: String? = null
+    // Guards the durable pending read so onStart and a status reconnect cannot
+    // queue the same recovery twice.
+    private var pendingRecoveryActive = false
     private var savedHandoff: JSONObject? = null
     // Kept across a status reconnect: the adopted card may no longer be listed
     // as an eligible disk once it holds private storage.
@@ -190,6 +199,10 @@ class MainActivity : Activity(), ShizukuManager.Callback {
         super.onStart()
         manager.addCallback(this)
         manager.start()
+        // The durable private pending handoff is independent of the service:
+        // recover it on every foreground, including an idle or not-yet-ready
+        // service, without preparing or formatting anything.
+        recoverPendingHandoff()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -523,6 +536,9 @@ class MainActivity : Activity(), ShizukuManager.Callback {
                     selectedCard?.let { requestSummaryInfo(it.id) }
                 }
                 manager.requestStatus { status, _ -> status?.let { handleStatus(it) } }
+                // Reconnected/idle: recover the durable pending handoff even
+                // when the service never reports partitioned+null-handoff.
+                recoverPendingHandoff()
             }
             ShizukuManager.State.BINDER_LOST -> {
                 clearCards()
@@ -557,8 +573,12 @@ class MainActivity : Activity(), ShizukuManager.Callback {
                 operationBusy = true
                 setKeepScreenOn(true)
                 handoffGroup.visibility = View.GONE
-                handoffReady = false
+                // A live run rewrites the card: earlier completion and any
+                // in-flight recovery/write callback are stale from here on.
+                handoffLifecycle.begin()
                 savedHandoff = null
+                handoffLatestKey = null
+                handoffFailedKey = null
                 androidReadyCapacity = null
                 // The old live snapshot no longer describes the card being
                 // rewritten; only the fresh post-success inspection may.
@@ -1153,6 +1173,15 @@ class MainActivity : Activity(), ShizukuManager.Callback {
     }
 
     private fun startOperation(token: String) {
+        // A confirmed new start drops the old completion and invalidates any
+        // asynchronous pending-read or write callback BEFORE the IPC/polling.
+        // The durable pending file itself is preserved.
+        handoffLifecycle.begin()
+        savedHandoff = null
+        handoffLatestKey = null
+        handoffFailedKey = null
+        androidReadyCapacity = null
+        handoffGroup.visibility = View.GONE
         manager.start(token) { status, error ->
             if (error != null) {
                 showError(error)
@@ -1170,60 +1199,254 @@ class MainActivity : Activity(), ShizukuManager.Callback {
 
     // --- handoff -------------------------------------------------------------
 
+    /**
+     * Publishes the live handoff unless this exact payload is already proven
+     * complete. Completion is bound to the payload identity, so a genuinely new
+     * payload after an earlier mixed or all-Android success is still written
+     * while a repeated status for the same successful payload is not.
+     *
+     * The newest payload is stored even while an older write is still running:
+     * that write may land stale, and the new handoff must still reach the card.
+     * Only one write ever runs; a newer payload replaces the queued one instead
+     * of stacking up.
+     */
     private fun maybeWriteHandoff(handoff: JSONObject) {
-        if (handoffWriting || handoffReady) return
+        val key = handoffKey(handoff)
         savedHandoff = JSONObject(handoff.toString())
-        writeHandoff(useSaved = true)
+        handoffLatestKey = key
+        handoffFailedKey = null
+        // A different payload invalidates older async results; the same payload
+        // (or one already proven) keeps the running write current.
+        handoffLifecycle.selectPayload(key)
+        if (handoffLifecycle.decisionFor(key) ==
+            HandoffLifecycle.PublishDecision.ALREADY_COMPLETE
+        ) {
+            return
+        }
+        scheduleLatestHandoff()
+    }
+
+    /**
+     * Starts the newest selected payload when no write or recovery is running
+     * and no partition work supersedes it. At most one payload is ever queued,
+     * so a burst of new payloads coalesces onto the latest instead of growing
+     * an unbounded backlog.
+     */
+    private fun scheduleLatestHandoff() {
+        if (handoffWriting || pendingRecoveryActive) return
+        if (operationBusy || awaitingPartitionResult) return
+        val key = handoffLatestKey ?: return
+        if (key == handoffFailedKey) return
+        val handoff = savedHandoff ?: return
+        if (handoffKey(handoff) != key) return
+        handoffLifecycle.selectPayload(key)
+        // Re-check through the freshly selected key so only a payload that
+        // still needs publication is ever queued.
+        if (!handoffLifecycle.currentNeedsPublication()) return
+        writeHandoff(key)
     }
 
     private fun retryHandoff() {
         if (handoffWriting) return
-        writeHandoff(useSaved = savedHandoff != null)
+        val handoff = savedHandoff
+        if (handoff != null) {
+            writeHandoff(handoffKey(handoff))
+        } else {
+            // No parsed payload in memory: re-read the durable pending copy.
+            recoverPendingHandoff()
+        }
     }
 
     /**
-     * Recovered on reconnect when the service reports a partitioned card but no
-     * handoff payload: the private pending copy, if any, is re-published. Never
-     * repartitions.
+     * Recovers the durable private pending handoff independently of the
+     * service's partitioned+null-handoff response: on app start, reconnect and
+     * idle. It only ever validates through [HandoffWriter.pending] and
+     * re-publishes through the writer's UUID-bound app-specific destination, so
+     * it never guesses a path, formats anything or marks a corrupt payload
+     * ready. A pending copy already intact on the public volume (the cached
+     * copy v0.3 left behind) is treated as success.
      */
     private fun recoverPendingHandoff() {
-        if (handoffWriting || handoffReady) return
-        handoffExecutor.execute {
-            val pending = try {
-                HandoffWriter(this).pending()
-            } catch (t: Exception) {
-                null
-            }
-            uiHandler.post {
-                if (pending != null) {
-                    savedHandoff = JSONObject(pending.toString())
-                    writeHandoff(useSaved = true)
+        if (handoffWriting || pendingRecoveryActive ||
+            operationBusy || awaitingPartitionResult
+        ) {
+            return
+        }
+        pendingRecoveryActive = true
+        val generation = handoffLifecycle.currentGeneration()
+        handoffExecutor.execute { recoverPendingHandoffOnce(generation, freshPass = false) }
+    }
+
+    /**
+     * One recovery pass over the durable pending copy, bound to [generation].
+     *
+     * The pass reads, verifies, retries and clears only the payload it
+     * captured. A superseded snapshot is never adopted, scheduled or reported:
+     * the still-current generation is given exactly one fresh pass over
+     * whatever is pending now, every other generation is dropped. A fresh pass
+     * that finds no pending file stops instead of looping.
+     */
+    private fun recoverPendingHandoffOnce(generation: Long, freshPass: Boolean) {
+        var pending: JSONObject? = null
+        var key: String? = null
+        var failure: String? = null
+        var published = false
+        var superseded = false
+        try {
+            val writer = HandoffWriter(this)
+            val stored = writer.pending()
+            if (stored != null) {
+                pending = stored
+                key = handoffKey(stored)
+                if (handoffLifecycle.isCurrent(generation)) {
+                    // Read, verify, retry and cleanup all stay bound to the
+                    // captured payload, so a newer pending copy written by
+                    // another executor is never published or deleted as if
+                    // it were this one.
+                    if (writer.pendingIsPublished(stored)) {
+                        published = true
+                    } else {
+                        // `null` means this snapshot is gone (superseded or
+                        // completed) and must never be re-published.
+                        published = writer.retryExpected(stored) != null
+                        superseded = !published
+                    }
+                    if (published) {
+                        try {
+                            writer.clearPending(stored)
+                        } catch (t: Exception) {
+                            // The published copy is verified; a failed
+                            // cleanup only leaves the legacy cached copy.
+                        }
+                    }
                 }
+            }
+        } catch (e: HandoffException) {
+            failure = e.code
+        } catch (t: Exception) {
+            failure = ERR_HANDOFF_WRITE_FAILED
+        }
+        val recoveredPending = pending
+        val recoveredKey = key
+        val recoveredFailure = failure
+        val recovered = published
+        val wasSuperseded = superseded
+        uiHandler.post {
+            when (handoffLifecycle.recoveryDisposition(generation, wasSuperseded)) {
+                HandoffLifecycle.RecoveryDisposition.RELOAD -> {
+                    // Drop the superseded snapshot while it is still the queued
+                    // payload, so no later pass can re-publish it, then read the
+                    // newest pending copy in exactly one fresh pass.
+                    if (recoveredKey != null && handoffLatestKey == recoveredKey) {
+                        savedHandoff = null
+                        handoffLatestKey = null
+                    }
+                    if (!freshPass && !handoffExecutor.isShutdown) {
+                        handoffExecutor.execute {
+                            recoverPendingHandoffOnce(generation, freshPass = true)
+                        }
+                        return@post
+                    }
+                    pendingRecoveryActive = false
+                }
+                HandoffLifecycle.RecoveryDisposition.IGNORE -> {
+                    pendingRecoveryActive = false
+                }
+                HandoffLifecycle.RecoveryDisposition.APPLY -> {
+                    pendingRecoveryActive = false
+                    if (recoveredPending != null) {
+                        savedHandoff = recoveredPending
+                        if (recoveredKey != null) handoffLatestKey = recoveredKey
+                    }
+                    when {
+                        recovered && recoveredKey != null -> {
+                            if (handoffLifecycle.writeCompleted(generation, recoveredKey, true)) {
+                                onHandoffSuccess()
+                            }
+                        }
+                        recoveredFailure != null -> {
+                            handoffFailedKey = recoveredKey
+                            onHandoffFailure(recoveredFailure)
+                        }
+                    }
+                }
+            }
+            // A superseded or stale recovery may have left the newest payload
+            // unpublished; only one writer is ever started.
+            scheduleLatestHandoff()
+            updateControls()
+        }
+    }
+
+    private fun writeHandoff(payloadKey: String) {
+        val handoff = savedHandoff ?: return
+        // Never publish a payload other than the one this write was selected for.
+        if (handoffKey(handoff) != payloadKey) return
+        if (handoffExecutor.isShutdown) return
+        handoffWriting = true
+        handoffFailedKey = null
+        textStatus.text = getString(R.string.handoff_writing)
+        updateControls()
+        val generation = handoffLifecycle.currentGeneration()
+        handoffExecutor.execute {
+            var failure: String? = null
+            var stale = !handoffLifecycle.isCurrent(generation)
+            if (!stale) {
+                try {
+                    val writer = HandoffWriter(this)
+                    val payload = JSONObject(handoff.toString())
+                    writer.write(payload)
+                    // Publish+readback+volume verification already succeeded;
+                    // only this exact payload may now lose its private copy.
+                    try {
+                        writer.clearPending(payload)
+                    } catch (t: Exception) {
+                        // Non-fatal: the verified public copy is authoritative.
+                    }
+                } catch (e: HandoffException) {
+                    failure = e.code
+                } catch (t: Exception) {
+                    failure = ERR_HANDOFF_WRITE_FAILED
+                }
+                if (!handoffLifecycle.isCurrent(generation)) stale = true
+            }
+            val writeFailure = failure
+            val writeStale = stale
+            val succeeded = !writeStale && writeFailure == null
+            uiHandler.post {
+                handoffWriting = false
+                if (!writeStale && handoffLifecycle.isCurrent(generation)) {
+                    if (succeeded) {
+                        if (handoffLifecycle.writeCompleted(generation, payloadKey, true)) {
+                            onHandoffSuccess()
+                        }
+                    } else {
+                        handoffFailedKey = payloadKey
+                        onHandoffFailure(writeFailure ?: ERR_HANDOFF_WRITE_FAILED)
+                    }
+                } else {
+                    // A newer payload superseded this write while it ran.
+                    scheduleLatestHandoff()
+                }
+                updateControls()
             }
         }
     }
 
-    private fun writeHandoff(useSaved: Boolean) {
-        val handoff = savedHandoff
-        if (useSaved && handoff == null) return
-        handoffWriting = true
-        textStatus.text = getString(R.string.handoff_writing)
-        updateControls()
-        handoffExecutor.execute {
-            val result = try {
-                val writer = HandoffWriter(this)
-                if (useSaved && handoff != null) writer.write(JSONObject(handoff.toString())) else writer.retry()
-                null
-            } catch (e: HandoffException) {
-                e.code
-            } catch (t: Exception) {
-                ERR_HANDOFF_WRITE_FAILED
-            }
-            uiHandler.post {
-                handoffWriting = false
-                if (result == null) onHandoffSuccess() else onHandoffFailure(result)
-                updateControls()
-            }
+    /**
+     * Deterministic identity of one handoff payload for in-memory dedup. Only
+     * the stable schema/partition fields are named; presentation-only additions
+     * from the service cannot change the identity.
+     */
+    private fun handoffKey(handoff: JSONObject): String {
+        val fields = arrayOf(
+            "magic", "schema_version", "identity_mode", "allocation_mode",
+            "card_cid", "disk_bytes", "linux_ratio", "public_fs_uuid",
+            "public_partition_guid", "private_partition_guid", "private_fs_uuid",
+        )
+        return fields.joinToString("|") { name ->
+            val value = handoff.opt(name)
+            if (value == null || value == JSONObject.NULL) "null" else value.toString()
         }
     }
 
@@ -1256,7 +1479,10 @@ class MainActivity : Activity(), ShizukuManager.Callback {
     }
 
     private fun onHandoffSuccess() {
-        handoffReady = true
+        // The coordinator has already recorded this exact payload as complete.
+        savedHandoff = null
+        handoffLatestKey = null
+        handoffFailedKey = null
         textStatus.text = ""
         handoffGroup.visibility = View.VISIBLE
         textHandoffTitle.setText(R.string.handoff_ready_title)
@@ -1268,12 +1494,14 @@ class MainActivity : Activity(), ShizukuManager.Callback {
     }
 
     private fun onHandoffFailure(code: String) {
-        handoffReady = false
         handoffGroup.visibility = View.VISIBLE
         textHandoffTitle.setText(R.string.handoff_failed_title)
         textHandoffTitle.setTextColor(getColor(R.color.color_danger))
         textHandoffMessage.text = getString(R.string.handoff_failed_message, localizedError(code))
-        buttonRetryHandoff.visibility = View.VISIBLE
+        // A malformed payload cannot be fixed by retrying; a missing card or a
+        // failed TF write can.
+        buttonRetryHandoff.visibility =
+            if (code == ERR_HANDOFF_INVALID) View.GONE else View.VISIBLE
         pushLocalLog(LEVEL_ERROR, code, null)
         revealHandoff()
     }
@@ -1289,8 +1517,12 @@ class MainActivity : Activity(), ShizukuManager.Callback {
      * idempotent, so a status reconnect keeps the same fresh result.
      */
     private fun onAndroidReady() {
-        handoffReady = true
+        // All-Android is a payload-bound completion too; it also invalidates
+        // any in-flight recovery for an older Linux payload.
+        handoffLifecycle.androidReady()
         savedHandoff = null
+        handoffLatestKey = null
+        handoffFailedKey = null
         androidOnlyCapacity()?.let { androidReadyCapacity = it }
         handoffGroup.visibility = View.VISIBLE
         textHandoffTitle.setText(R.string.handoff_android_ready_title)
@@ -1308,9 +1540,10 @@ class MainActivity : Activity(), ShizukuManager.Callback {
     }
 
     /**
-     * Deletes our own app-private pending handoff off the main thread. This only
-     * ever runs after a verified all-Android success; the published file on the
-     * card and any pending copy from a prepare/cancel/failure are left alone.
+     * Deletes our own app-private pending handoff off the main thread. It runs
+     * after a verified all-Android success; successful publishes clear the copy
+     * inline on the serial executor. A prepare/cancel/failed start never
+     * deletes a pending copy.
      */
     private fun clearPendingHandoff() {
         handoffExecutor.execute {
@@ -1341,15 +1574,19 @@ class MainActivity : Activity(), ShizukuManager.Callback {
 
     private fun updateControls() {
         val ready = manager.currentState() == ShizukuManager.State.READY
-        val busy = operationBusy || handoffWriting || manager.migrationActive ||
-            savedMigrationUnresolved()
+        // Work this Activity or the manager is running, as distinct from a saved
+        // handle that only still needs its destination verified.
+        val activeWork = operationBusy || handoffWriting || manager.migrationActive
+        val busy = activeWork || savedMigrationUnresolved()
         val hasCard = selectedCard?.eligible == true
         val screenState = allocationScreenState()
 
         renderAllocationMode()
         seekAllocation.isEnabled = !busy && screenState == AllocationScreenState.EDITOR
         cardSpinner.isEnabled = ready && !busy && spinnerCards.isNotEmpty()
-        buttonRefresh.isEnabled = ready && !busy
+        // Read-only re-inspection stays reachable while a saved handle is
+        // unresolved; it never formats or starts anything.
+        buttonRefresh.isEnabled = ready && !activeWork
         buttonReview.isEnabled =
             ready && !busy && hasCard && screenState == AllocationScreenState.EDITOR
         buttonRetryHandoff.isEnabled = !busy && savedHandoff != null
@@ -1367,20 +1604,19 @@ class MainActivity : Activity(), ShizukuManager.Callback {
             if (state == ShizukuManager.State.PERMISSION_NEEDED ||
                 state == ShizukuManager.State.PERMISSION_DENIED
             ) View.VISIBLE else View.GONE
-        buttonAuthorize.isEnabled = !busy &&
+        buttonAuthorize.isEnabled = !activeWork &&
             (state == ShizukuManager.State.PERMISSION_NEEDED || state == ShizukuManager.State.PERMISSION_DENIED)
-        buttonOpenShizuku.isEnabled = !busy
+        buttonOpenShizuku.isEnabled = !activeWork
     }
 
     /**
-     * A saved start/running handle blocks destructive actions even after the
-     * process was restarted and the manager no longer has the in-memory flag.
-     * Migration management stays reachable so the saved move can be resolved.
+     * A saved starting/running/unverified handle blocks destructive actions even
+     * after the process was restarted and the manager no longer has the in-memory
+     * flag. Migration management stays reachable so the saved move can be
+     * resolved.
      */
-    private fun savedMigrationUnresolved(): Boolean {
-        val handle = AppSettings.migrationHandle(this) ?: return false
-        return handle.state == MIGRATION_STATE_STARTING || handle.state == MIGRATION_STATE_RUNNING
-    }
+    private fun savedMigrationUnresolved(): Boolean =
+        AppSettings.migrationHandle(this)?.isUnresolved == true
 
     private fun updateShizukuText(state: ShizukuManager.State, identity: String?) {
         val textRes = when (state) {
@@ -1702,11 +1938,10 @@ class MainActivity : Activity(), ShizukuManager.Callback {
         const val REASON_UNKNOWN = "unknown"
         const val ERR_NOT_READY = "service_not_ready"
         const val ERR_HANDOFF_WRITE_FAILED = "handoff_write_failed"
+        const val ERR_HANDOFF_INVALID = "handoff_invalid"
         const val STATE_RUNNING = "running"
         const val STATE_PARTITIONED = "partitioned"
         const val STATE_FAILED = "failed"
-        const val MIGRATION_STATE_STARTING = "starting"
-        const val MIGRATION_STATE_RUNNING = "running"
         const val PHASE_ANDROID_READY = "android_ready"
         const val HANDOFF_CLEAR_FAILED = "handoff_clear_failed"
         const val LEVEL_INFO = "info"

@@ -10,6 +10,7 @@ import android.os.IBinder
 import android.os.Looper
 import io.github.mydanyi.armadatf.BuildConfig
 import io.github.mydanyi.armadatf.IStorageService
+import io.github.mydanyi.armadatf.domain.MigrationInventoryPaging
 import io.github.mydanyi.armadatf.storage.StorageUserService
 import org.json.JSONArray
 import org.json.JSONObject
@@ -110,6 +111,8 @@ class ShizukuManager private constructor(private val appContext: Context) {
         val packageName: String?,
         val error: String?,
         val detail: String?,
+        /** Canonical framework instance that issued the numeric id. */
+        val frameworkId: String?,
     )
 
     /** One application row of the read-only migration inventory. */
@@ -140,6 +143,8 @@ class ShizukuManager private constructor(private val appContext: Context) {
         val appsTruncated: Boolean,
         val appsError: String?,
         val activeMigration: MigrationStatus?,
+        /** Framework instance the summary was read from; never a guess. */
+        val frameworkId: String?,
     )
 
     data class MigrationVolume(
@@ -200,6 +205,7 @@ class ShizukuManager private constructor(private val appContext: Context) {
 
     private var migrationPolling = false
     private var migrationMoveId: Int? = null
+    private var migrationPollFrameworkId: String? = null
 
     private val migrationPollRunnable = Runnable { pollMigrationOnce() }
 
@@ -467,6 +473,9 @@ class ShizukuManager private constructor(private val appContext: Context) {
     fun prepare(diskId: String, androidPercent: Int, callback: (Prepared?, IpcError?) -> Unit) {
         val linuxPercent = 100 - androidPercent
         withService(callback) { service ->
+            if (hasUnresolvedMigration()) {
+                return@withService null to IpcError(ERR_BUSY, null)
+            }
             val json = JSONObject(service.prepare(diskId, linuxPercent))
             if (!json.optBoolean("ok", false)) {
                 return@withService null to errorOf(json)
@@ -487,6 +496,9 @@ class ShizukuManager private constructor(private val appContext: Context) {
 
     fun start(token: String, callback: (OperationStatus?, IpcError?) -> Unit) {
         withService(callback) { service ->
+            if (hasUnresolvedMigration()) {
+                return@withService null to IpcError(ERR_BUSY, null)
+            }
             val json = JSONObject(service.start(token, true))
             if (!json.optBoolean("ok", false)) {
                 return@withService null to errorOf(json)
@@ -531,9 +543,92 @@ class ShizukuManager private constructor(private val appContext: Context) {
             if (!json.optBoolean("ok", false)) {
                 return@withService null to errorOf(json)
             }
-            parseMigrationOverview(json.getJSONObject("data")) to null
+            val data = json.getJSONObject("data")
+            val summary = parseMigrationOverview(data)
+            val token = nullableString(data, "apps_token")
+            val count = data.optInt("apps_count", -1)
+            if (summary.appsError != null || count <= 0) {
+                return@withService summary to null
+            }
+            if (token == null) {
+                return@withService summary.copy(appsError = ERR_INVENTORY_PAGE) to null
+            }
+            try {
+                summary.copy(apps = fetchMigrationApps(service, token, count)) to null
+            } catch (t: Throwable) {
+                // Keep primary/active/move-back fields; hide the incomplete list.
+                summary.copy(apps = emptyList(), appsError = ERR_INVENTORY_PAGE) to null
+            }
         }
     }
+
+    /**
+     * Reads the whole frozen inventory through bounded pages. The total and
+     * token come from the summary; every page must advance by exactly the rows
+     * it reports, so a malformed page fails instead of dropping applications.
+     */
+    private fun fetchMigrationApps(
+        service: IStorageService,
+        token: String,
+        total: Int,
+    ): List<MigrationApp> {
+        val apps = ArrayList<MigrationApp>(total)
+        var offset = 0
+        while (offset < total) {
+            val json = JSONObject(
+                service.migrationAppsPage(
+                    token,
+                    offset,
+                    MigrationInventoryPaging.MAX_ROWS_PER_PAGE,
+                ),
+            )
+            if (!json.optBoolean("ok", false)) {
+                throw InventoryPageException(errorOf(json))
+            }
+            val data = json.getJSONObject("data")
+            if (nullableString(data, "token") != token) {
+                throw InventoryPageException(
+                    IpcError(ERR_INVENTORY_PAGE, "inventory token changed"),
+                )
+            }
+            val array = data.optJSONArray("apps")
+                ?: throw InventoryPageException(
+                    IpcError(ERR_INVENTORY_PAGE, "page has no apps"),
+                )
+            val rows = ArrayList<MigrationApp>(array.length())
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index)
+                    ?: throw InventoryPageException(
+                        IpcError(ERR_INVENTORY_PAGE, "malformed app row"),
+                    )
+                rows.add(parseMigrationApp(item))
+            }
+            val progress = try {
+                MigrationInventoryPaging.validatePage(
+                    requestedOffset = offset,
+                    limit = MigrationInventoryPaging.MAX_ROWS_PER_PAGE,
+                    total = total,
+                    pageOffset = data.optInt("offset", -1),
+                    pageTotal = data.optInt("total", -1),
+                    nextOffset = data.optInt("next_offset", -1),
+                    rowCount = rows.size,
+                )
+            } catch (e: MigrationInventoryPaging.InvalidPageException) {
+                throw InventoryPageException(IpcError(ERR_INVENTORY_PAGE, e.message))
+            }
+            apps.addAll(rows)
+            offset = progress.nextOffset
+            if (progress.complete) break
+        }
+        if (apps.size != total) {
+            throw InventoryPageException(
+                IpcError(ERR_INVENTORY_PAGE, "inventory remained incomplete"),
+            )
+        }
+        return apps
+    }
+
+    private class InventoryPageException(val error: IpcError) : IllegalStateException(error.detail)
 
     /** Prepares a one-use migration token; no card or package is changed. */
     fun prepareMigration(
@@ -541,6 +636,9 @@ class ShizukuManager private constructor(private val appContext: Context) {
         callback: (PreparedMigration?, IpcError?) -> Unit,
     ) {
         withService(callback) { service ->
+            if (hasUnresolvedMigration()) {
+                return@withService null to IpcError(ERR_BUSY, null)
+            }
             val json = JSONObject(service.prepareMigration(request.toJson().toString()))
             if (!json.optBoolean("ok", false)) {
                 return@withService null to errorOf(json)
@@ -593,22 +691,30 @@ class ShizukuManager private constructor(private val appContext: Context) {
         }
     }
 
-    /** One read-only status query; the caller owns any polling loop. */
+    /**
+     * One read-only status query for [moveId] inside [expectedFrameworkId]; the
+     * caller owns any polling loop. The identity is mandatory because a numeric
+     * id of another framework instance may name an unrelated move.
+     */
     fun requestMigrationStatus(
         moveId: Int,
+        expectedFrameworkId: String?,
         callback: (MigrationStatus?, IpcError?) -> Unit,
     ) {
+        if (expectedFrameworkId == null) {
+            // Without a namespace the id cannot be attributed: report the call
+            // as unverified instead of guessing an outcome.
+            postMain { callback(null, IpcError(ERR_MOVE_IDENTITY_UNVERIFIED, null)) }
+            return
+        }
         withService(callback) { service ->
-            val json = JSONObject(service.migrationStatus(moveId))
+            val json = JSONObject(service.migrationStatus(moveId, expectedFrameworkId))
             if (!json.optBoolean("ok", false)) {
                 return@withService null to errorOf(json)
             }
-            val status = parseMigrationStatus(json.getJSONObject("data"))
-            // Only a parsed native answer decides the busy state. An unreadable
-            // status says nothing about the move and must not look like a
-            // native failure.
-            setMigrationActive(status.state == MIGRATION_RUNNING)
-            status to null
+            // The busy state is settled by the checked poll callback, so a late
+            // answer for an older (id, instance) pair cannot change it here.
+            parseMigrationStatus(json.getJSONObject("data")) to null
         }
     }
 
@@ -621,12 +727,29 @@ class ShizukuManager private constructor(private val appContext: Context) {
         setMigrationActive(false)
     }
 
+    /**
+     * True while a durable migration handle still has to be resolved.
+     *
+     * Read-only: refresh, status and recovery stay available. Queued IPC work
+     * consults it inside the executor lambda, so a call queued before a handle
+     * was persisted still sees the current gate instead of bypassing the
+     * disabled UI after a restart. `startMigration` deliberately does not use
+     * it: its own `starting` handle is persisted before its IPC by design.
+     */
+    fun hasUnresolvedMigration(): Boolean =
+        AppSettings.migrationHandle(appContext)?.isUnresolved == true
+
     /** App-scoped migration polling; terminal/unavailable answers stop it. */
-    fun startMigrationPolling(moveId: Int) {
+    fun startMigrationPolling(moveId: Int, frameworkId: String?) {
         synchronized(lock) {
-            if (migrationPolling && migrationMoveId == moveId) return
+            if (migrationPolling && migrationMoveId == moveId &&
+                migrationPollFrameworkId == frameworkId
+            ) {
+                return
+            }
             migrationPolling = true
             migrationMoveId = moveId
+            migrationPollFrameworkId = frameworkId
         }
         mainHandler.removeCallbacks(migrationPollRunnable)
         // A restored known move is busy immediately, before the first poll.
@@ -638,23 +761,38 @@ class ShizukuManager private constructor(private val appContext: Context) {
         synchronized(lock) {
             migrationPolling = false
             migrationMoveId = null
+            migrationPollFrameworkId = null
         }
         mainHandler.removeCallbacks(migrationPollRunnable)
     }
 
     private fun pollMigrationOnce() {
-        val moveId = synchronized(lock) {
-            if (migrationPolling) migrationMoveId else null
+        val tracked = synchronized(lock) {
+            if (!migrationPolling) {
+                null
+            } else {
+                migrationMoveId?.let { it to migrationPollFrameworkId }
+            }
         }
-        if (moveId == null) {
+        if (tracked == null) {
             stopMigrationPolling()
             return
         }
-        requestMigrationStatus(moveId) { status, error ->
+        val (moveId, frameworkId) = tracked
+        requestMigrationStatus(moveId, frameworkId) { status, error ->
+            // The captured pair must still be the tracked one: a late answer
+            // for an older query may neither dispatch nor touch busy state.
+            val current = synchronized(lock) {
+                migrationPolling &&
+                    migrationMoveId == moveId &&
+                    migrationPollFrameworkId == frameworkId
+            }
+            if (!current) return@requestMigrationStatus
+            if (status != null) setMigrationActive(status.state == MIGRATION_RUNNING)
             dispatchMigration(status, error)
             val running = status != null && status.state == MIGRATION_RUNNING
             // A transport/read failure says nothing about the native move, so
-            // keep polling the same id instead of dropping the tracking.
+            // keep polling the same pair instead of dropping the tracking.
             val retry = status == null && error != null && isTransportFailure(error.code)
             if ((running || retry) && synchronized(lock) { migrationPolling }) {
                 mainHandler.postDelayed(migrationPollRunnable, POLL_INTERVAL_MS)
@@ -826,6 +964,7 @@ class ShizukuManager private constructor(private val appContext: Context) {
         packageName = nullableString(data, "package_name"),
         error = nullableString(data, "error"),
         detail = nullableString(data, "detail"),
+        frameworkId = nullableString(data, "framework_id"),
     )
 
     private fun parseMigrationApp(data: JSONObject): MigrationApp = MigrationApp(
@@ -878,6 +1017,7 @@ class ShizukuManager private constructor(private val appContext: Context) {
             appsTruncated = data.optBoolean("apps_truncated", false),
             appsError = nullableString(data, "apps_error"),
             activeMigration = active,
+            frameworkId = nullableString(data, "framework_id"),
         )
     }
 
@@ -958,7 +1098,10 @@ class ShizukuManager private constructor(private val appContext: Context) {
         private const val STATE_RUNNING = "running"
         private const val POLL_INTERVAL_MS = 1_000L
         private const val ERR_NOT_READY = "service_not_ready"
+        private const val ERR_BUSY = "busy"
         private const val ERR_INTERNAL = "internal_error"
+        private const val ERR_INVENTORY_PAGE = "inventory_page_failed"
+        private const val ERR_MOVE_IDENTITY_UNVERIFIED = "move_identity_unverified"
 
         fun get(context: Context): ShizukuManager {
             val existing = instance
