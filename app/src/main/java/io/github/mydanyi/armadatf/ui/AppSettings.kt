@@ -66,6 +66,40 @@ data class MigrationHandle(
         return saved != current
     }
 
+    /**
+     * True only when this persisted handle may be polled or resumed inside the
+     * running boot: it must still be a live request (`running`/`unverified`),
+     * carry a real native move id (framework ids start at 0, so 0 is a
+     * legitimate id), and prove the same kernel boot on both sides.
+     *
+     * A disk-loaded id is never proof on its own; the kernel boot id is what
+     * ties the persisted request to the native task that produced it. A
+     * missing, unreadable or changed boot yields false, so an unproven legacy
+     * id is never polled.
+     */
+    fun canPollInBoot(currentBootId: String?): Boolean {
+        if (state != STATE_RUNNING && state != STATE_UNVERIFIED) return false
+        if (!isValidNativeMoveId(moveId)) return false
+        val saved = canonicalBootId(bootId) ?: return false
+        val current = canonicalBootId(currentBootId) ?: return false
+        return saved == current
+    }
+
+    /**
+     * Recovery baseline for a legacy request whose saved boot proof is absent
+     * or malformed and which no retained native record describes. The retained
+     * id was never proven in this boot, so it is dropped instead of being
+     * stamped with the live boot; the request identity and the unresolved
+     * state stay. [liveBootId] is stored only when it is a canonical UUID, so
+     * even an unreadable live boot leaves the id dropped and the handle
+     * unpollable.
+     *
+     * The baseline can only support a later full-reboot recovery from the
+     * actual source/destination; it can never make the old id pollable again.
+     */
+    fun withRecoveryBaseline(liveBootId: String?): MigrationHandle =
+        copy(moveId = null, bootId = canonicalBootId(liveBootId))
+
     companion object {
         const val STATE_STARTING = "starting"
         const val STATE_RUNNING = "running"
@@ -78,6 +112,14 @@ data class MigrationHandle(
             STATE_RUNNING,
             STATE_UNVERIFIED,
         )
+
+        /**
+         * True when [raw] is a native move id this build may use. AOSP numbers
+         * moves from 0 (`mNextMoveId.getAndIncrement`) and the backend rejects
+         * only negative values, so 0 is a real id while -1 is the stored
+         * "absent" sentinel.
+         */
+        fun isValidNativeMoveId(raw: Int?): Boolean = raw != null && raw >= 0
 
         /**
          * Canonical lowercase form of [raw], or `null` unless it is a full UUID.
@@ -246,7 +288,7 @@ object AppSettings {
             }
             val rawMoveId = json.optInt("move_id", -1)
             MigrationHandle(
-                moveId = rawMoveId.takeIf { it > 0 },
+                moveId = rawMoveId.takeIf { MigrationHandle.isValidNativeMoveId(it) },
                 diskId = diskId,
                 kind = kind,
                 targetUuid = targetUuid,

@@ -32,6 +32,100 @@ class MigrationHandleUnresolvedTest {
         const val BOOT_B = "a71d5e0c-2c48-4f9b-b3a7-6d81c4f2b0e5"
     }
 
+    // --- current-boot polling policy -----------------------------------------
+
+    @Test
+    fun legacyRetainedIdWithoutBootProofNeverPollsInReady() {
+        // The saved handle names id 7 but has no boot id, so nothing ties it to
+        // a native task in this boot: not even a READY transition may poll it.
+        val legacy = handle("running", moveId = 7, bootId = null)
+        assertFalse(legacy.canPollInBoot(BOOT_A))
+
+        // The production baseline stores the live boot and drops the unproven
+        // id, so the request stays unresolved and unpollable.
+        val baseline = legacy.withRecoveryBaseline(BOOT_A)
+        assertNull(baseline.moveId)
+        assertEquals(BOOT_A, baseline.bootId)
+        assertTrue(baseline.isUnresolved)
+        assertFalse(baseline.canPollInBoot(BOOT_A))
+    }
+
+    @Test
+    fun baselineDropsUnknownLegacyIdEvenWithoutALiveBoot() {
+        val legacy = handle("starting", moveId = 7, bootId = null)
+        val baseline = legacy.withRecoveryBaseline(null)
+        assertNull(baseline.moveId)
+        assertNull(baseline.bootId)
+        assertTrue(baseline.isUnresolved)
+        // Request and card identity are preserved for a later recovery.
+        assertEquals(legacy.diskId, baseline.diskId)
+        assertEquals(legacy.kind, baseline.kind)
+        assertEquals(legacy.targetUuid, baseline.targetUuid)
+        assertEquals(legacy.sourceUuid, baseline.sourceUuid)
+        assertEquals(legacy.privateUuid, baseline.privateUuid)
+        assertEquals(legacy.packageName, baseline.packageName)
+        assertFalse(baseline.canPollInBoot(BOOT_A))
+        assertFalse(baseline.hasRebooted(BOOT_A))
+    }
+
+    @Test
+    fun malformedLiveBootStillDropsTheLegacyId() {
+        val baseline = handle("unverified", moveId = 7, bootId = null)
+            .withRecoveryBaseline("not-a-uuid")
+        assertNull(baseline.moveId)
+        assertNull(baseline.bootId)
+        assertTrue(baseline.isUnresolved)
+    }
+
+    @Test
+    fun recoveryBaselineNeverPollsTheOldResultAndLaterBootOnlyProvesTheReboot() {
+        val baseline = handle("unverified", moveId = 7, bootId = null)
+            .withRecoveryBaseline(BOOT_A)
+        assertFalse(baseline.canPollInBoot(BOOT_A))
+        // A later full reboot is real proof, but the dropped id stays dropped.
+        assertTrue(baseline.hasRebooted(BOOT_B))
+        assertFalse(baseline.canPollInBoot(BOOT_B))
+    }
+
+    @Test
+    fun genuineSameBootIdRemainsPollable() {
+        assertTrue(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
+        assertTrue(handle("unverified", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
+    }
+
+    @Test
+    fun changedMissingOrMalformedBootIsNeverPollable() {
+        assertFalse(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_B))
+        assertFalse(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot(null))
+        assertFalse(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot(""))
+        assertFalse(handle("running", moveId = 7, bootId = BOOT_A).canPollInBoot("not-a-uuid"))
+        assertFalse(handle("running", moveId = 7, bootId = null).canPollInBoot(BOOT_A))
+        assertFalse(handle("running", moveId = 7, bootId = "boot-one").canPollInBoot("boot-one"))
+    }
+
+    @Test
+    fun terminalUnknownStartingAndIdlessStatesAreNeverPollable() {
+        assertFalse(handle("starting", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
+        assertFalse(handle("completed", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
+        assertFalse(handle("failed", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
+        assertFalse(handle("unknown", moveId = 7, bootId = BOOT_A).canPollInBoot(BOOT_A))
+        assertFalse(handle("running", moveId = null, bootId = BOOT_A).canPollInBoot(BOOT_A))
+        assertFalse(handle("running", moveId = -1, bootId = BOOT_A).canPollInBoot(BOOT_A))
+    }
+
+    @Test
+    fun zeroIsALegitimateNativeMoveId() {
+        // AOSP numbers moves from 0, so only negatives are invalid.
+        assertTrue(MigrationHandle.isValidNativeMoveId(0))
+        assertTrue(MigrationHandle.isValidNativeMoveId(7))
+        assertFalse(MigrationHandle.isValidNativeMoveId(null))
+        assertFalse(MigrationHandle.isValidNativeMoveId(-1))
+        assertFalse(MigrationHandle.isValidNativeMoveId(Int.MIN_VALUE))
+        val zero = handle("running", moveId = 0, bootId = BOOT_A)
+        assertTrue(zero.canPollInBoot(BOOT_A))
+        assertTrue(zero.isUnresolved)
+    }
+
     @Test
     fun unverifiedHandleRestoredInANewProcessStillBlocks() {
         // AppSettings.migrationHandle() rebuilds exactly these fields on a fresh

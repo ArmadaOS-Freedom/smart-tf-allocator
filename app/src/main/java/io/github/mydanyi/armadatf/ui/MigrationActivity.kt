@@ -89,7 +89,10 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         applyInsets()
         setupLogs()
         handle = AppSettings.migrationHandle(this)
-        currentMoveId = handle?.moveId
+        // A disk-loaded id is never proof by itself: it becomes process-local
+        // only when the current-boot policy passes (see resumeSavedPolling) or
+        // a native start/retained record supplies it in this process.
+        currentMoveId = null
         render()
     }
 
@@ -200,9 +203,12 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         // task ended with the reboot, so its answer is skipped until the
         // destination itself has been verified.
         if (handle?.hasRebooted(AppSettings.currentBootId()) == true) return
+        // Only an id this boot actually owns may be attributed to the saved
+        // request: a stale answer for a dropped legacy id must neither adopt an
+        // id-less baseline nor release its unresolved protection.
+        val owned = ownedMoveId()
         if (status != null) {
-            val expected = currentMoveId ?: handle?.moveId
-            if (expected != null && status.moveId != expected) return
+            if (owned == null || status.moveId != owned) return
             when (status.state) {
                 ShizukuManager.MIGRATION_RUNNING -> adoptRunning(status)
                 ShizukuManager.MIGRATION_COMPLETED -> verifyCompletedMove()
@@ -217,6 +223,9 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         // destination_unverified answer still reaches the saved destination
         // check instead of being dropped.
         if (!h.isUnresolved) return
+        // The failure must speak for the same owned id: a stale answer must not
+        // settle a request this boot never owned.
+        if (owned == null) return
         when (MigrationPollErrorPolicy.actionFor(error.code)) {
             MigrationPollErrorAction.VERIFY_DESTINATION -> verifySavedDestination()
             MigrationPollErrorAction.WAIT_FOR_CONNECTION -> {
@@ -266,8 +275,9 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     private fun applyOverview(info: ShizukuManager.MigrationOverview) {
         overview = info
         val saved = handle
+        val liveBoot = AppSettings.currentBootId()
         if (saved != null && saved.diskId == info.diskId && saved.isUnresolved &&
-            saved.hasRebooted(AppSettings.currentBootId())
+            saved.hasRebooted(liveBoot)
         ) {
             // A confirmed kernel reboot ended any old native task: its id is
             // never adopted or polled again, the actual card is verified.
@@ -276,30 +286,40 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
             // Only a retained record that describes this exact request may
             // decide the outcome; a fast completion before the relaunch is
             // verified from the destination, never restarted.
-            val active = info.activeMigration?.takeIf { it.moveId > 0 && activeMatches(saved, it) }
+            val active = info.activeMigration?.takeIf {
+                MigrationHandle.isValidNativeMoveId(it.moveId) && activeMatches(saved, it)
+            }
             when {
                 active == null -> recoverWithoutRetainedMove(saved)
                 !cardMatches(saved, info) -> if (saved.state != STATE_UNVERIFIED) {
                     markUnverified(cardChanged = true)
                 }
                 active.state == ShizukuManager.MIGRATION_COMPLETED -> {
-                    adoptHandle(saved.copy(moveId = active.moveId))
+                    adoptHandle(
+                        saved.copy(moveId = active.moveId, bootId = provenBootId(saved, liveBoot)),
+                    )
                     verifySavedDestination()
                 }
                 active.state == ShizukuManager.MIGRATION_FAILED -> {
-                    adoptHandle(saved.copy(moveId = active.moveId))
+                    adoptHandle(
+                        saved.copy(moveId = active.moveId, bootId = provenBootId(saved, liveBoot)),
+                    )
                     markFailed(active.error ?: "failed_native")
                 }
                 else -> {
                     adoptHandle(
-                        saved.copy(moveId = active.moveId, state = ShizukuManager.MIGRATION_RUNNING),
+                        saved.copy(
+                            moveId = active.moveId,
+                            state = ShizukuManager.MIGRATION_RUNNING,
+                            bootId = provenBootId(saved, liveBoot),
+                        ),
                     )
                     manager.startMigrationPolling(active.moveId)
                 }
             }
         } else if (saved == null) {
             val active = info.activeMigration
-            if (active != null && active.moveId > 0 &&
+            if (active != null && MigrationHandle.isValidNativeMoveId(active.moveId) &&
                 active.state == ShizukuManager.MIGRATION_RUNNING
             ) {
                 // A retained native move after a relaunch: adopt, never restart.
@@ -359,23 +379,31 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
      * No retained service record describes this request in the current boot.
      * It stays unresolved: a fresh destination match alone cannot prove what
      * the old task did within the same kernel boot, so the user is asked to
-     * restart Android and refresh. A legacy handle without a boot id first
-     * stores the current one as a conservative baseline instead of guessing.
+     * restart Android and refresh.
+     *
+     * A legacy handle whose boot proof is absent or malformed first establishes
+     * a baseline: its unproven id is dropped (never stamped with the live boot)
+     * and polling stops, so only a later full reboot can settle it.
      */
     private fun recoverWithoutRetainedMove(saved: MigrationHandle) {
         keepUnresolved(saved)
         val current = handle ?: return
-        if (current.bootId == null) {
-            // Legacy handle with no baseline: record the current boot id so a
-            // later launch can prove a real restart. Nothing is verified yet.
-            AppSettings.currentBootId()?.let { live ->
-                handle = current.copy(bootId = live)
-                AppSettings.setMigrationHandle(this, handle)
-                pushLog(LEVEL_INFO, "migration_boot_baseline", null)
-            }
+        // A retained id without a matching boot proof was never proven in this
+        // boot, so it is dropped instead of being given the live boot. Request
+        // and card fields plus the unresolved state stay; a later full reboot
+        // with an actual source/destination match is the only recovery left.
+        if (MigrationHandle.canonicalBootId(current.bootId) == null) {
+            val baseline = current.withRecoveryBaseline(AppSettings.currentBootId())
+            handle = baseline
+            currentMoveId = null
+            lastProgress = null
+            AppSettings.setMigrationHandle(this, baseline)
+            manager.stopMigrationPolling()
+            pushLog(LEVEL_INFO, "migration_boot_baseline", null)
         }
-        if (current.moveId != null) return
-        // Same boot and no retained record: never verify the destination alone.
+        // A same-boot id remains the only live lead; its poll may answer later.
+        if (handle?.moveId != null) return
+        // No id can settle this request inside the same kernel boot.
         terminalText = getString(R.string.migration_status_recovery_reboot)
         terminalColor = R.color.color_warning
         setKeepScreenOn(false)
@@ -385,15 +413,18 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     private fun resumeSavedPolling() {
         val h = handle ?: return
         if (h.diskId != diskId) return
+        val liveBoot = AppSettings.currentBootId()
         // An id from a previous kernel boot is not resumable: that task ended
         // with the reboot, so polling it again would adopt a stale answer.
-        if (h.hasRebooted(AppSettings.currentBootId())) return
-        if (h.moveId != null &&
-            (h.state == ShizukuManager.MIGRATION_RUNNING || h.state == STATE_UNVERIFIED)
-        ) {
-            currentMoveId = h.moveId
-            manager.startMigrationPolling(h.moveId)
-        }
+        if (h.hasRebooted(liveBoot)) return
+        val savedId = h.moveId ?: return
+        if (h.state != ShizukuManager.MIGRATION_RUNNING && h.state != STATE_UNVERIFIED) return
+        // A disk-loaded id needs the current-boot policy; the process-local id
+        // is accepted only for that exact saved id, because a fresh native start
+        // or a matching retained record supplied it here.
+        if (!h.canPollInBoot(liveBoot) && currentMoveId != savedId) return
+        currentMoveId = savedId
+        manager.startMigrationPolling(savedId)
     }
 
     private fun adoptHandle(next: MigrationHandle) {
@@ -1100,7 +1131,9 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
         handle: MigrationHandle,
         active: ShizukuManager.MigrationStatus,
     ): Boolean {
-        if (handle.kind != (active.kind ?: handle.kind)) return false
+        // A missing active kind is not a match: the retained record must name
+        // the actual request it describes.
+        if (handle.kind != active.kind) return false
         if (handle.packageName != active.packageName) return false
         val target = active.targetUuid ?: return false
         return uuidEquals(handle.targetUuid, target) || destinationMatches(target, handle.targetUuid)
@@ -1109,6 +1142,28 @@ class MigrationActivity : Activity(), ShizukuManager.Callback {
     /** True while [captured] is still both the visible and the persisted request. */
     private fun savedRequestStillCurrent(captured: MigrationHandle): Boolean =
         handle == captured && AppSettings.migrationHandle(this) == captured
+
+    /**
+     * The native id this process may attribute a listener answer to: an id a
+     * fresh native start or a matching retained record already supplied here,
+     * or a persisted id whose current-boot policy passes. A disk-loaded id
+     * alone is never proof of ownership.
+     */
+    private fun ownedMoveId(): Int? {
+        val h = handle ?: return null
+        val saved = h.moveId ?: return null
+        if (currentMoveId == saved) return saved
+        return saved.takeIf { h.canPollInBoot(AppSettings.currentBootId()) }
+    }
+
+    /**
+     * Boot proof for an id adopted from a matching retained native record: live
+     * canonical boot when readable, else the one already stored. A malformed
+     * value on either side never becomes proof.
+     */
+    private fun provenBootId(saved: MigrationHandle, liveBootId: String?): String? =
+        MigrationHandle.canonicalBootId(liveBootId)
+            ?: MigrationHandle.canonicalBootId(saved.bootId)
 
     private fun destinationMatches(actual: String?, expected: String): Boolean =
         migrationLocationMatches(actual, expected)
