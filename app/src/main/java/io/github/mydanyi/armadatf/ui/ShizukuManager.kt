@@ -470,13 +470,22 @@ class ShizukuManager private constructor(private val appContext: Context) {
         }
     }
 
-    fun prepare(diskId: String, androidPercent: Int, callback: (Prepared?, IpcError?) -> Unit) {
+    fun prepare(
+        diskId: String,
+        androidPercent: Int,
+        forceReallocation: Boolean = false,
+        callback: (Prepared?, IpcError?) -> Unit,
+    ) {
         val linuxPercent = 100 - androidPercent
         withService(callback) { service ->
             if (hasUnresolvedMigration()) {
                 return@withService null to IpcError(ERR_BUSY, null)
             }
-            val json = JSONObject(service.prepare(diskId, linuxPercent))
+            val json = if (forceReallocation) {
+                JSONObject(service.prepareForcedReallocation(diskId, linuxPercent))
+            } else {
+                JSONObject(service.prepare(diskId, linuxPercent))
+            }
             if (!json.optBoolean("ok", false)) {
                 return@withService null to errorOf(json)
             }

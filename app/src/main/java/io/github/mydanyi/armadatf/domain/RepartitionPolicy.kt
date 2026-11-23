@@ -61,4 +61,21 @@ object RepartitionPolicy {
         }
         return if (occupied) MigrationErrors.MOVE_BACK_REQUIRED else null
     }
+
+    /**
+     * Decides whether a run-time rejection is allowed to be overridden by the
+     * prepared force flag bound to the same token.
+     *
+     * Only the move-back requirement and the app-query failure are overridable.
+     * Every other rejection (card missing/changed, native/security failures,
+     * unrelated migration codes) is returned unchanged, regardless of [force].
+     * `null` is treated as "no rejection" and passes through.
+     */
+    fun forceableRejection(code: String?, force: Boolean): String? {
+        if (!force || code == null) return code
+        return when (code) {
+            MigrationErrors.MOVE_BACK_REQUIRED, MigrationErrors.APP_QUERY_UNAVAILABLE -> null
+            else -> code
+        }
+    }
 }

@@ -159,6 +159,9 @@ class MainActivity : Activity(), ShizukuManager.Callback {
     private var languageInitialized = false
     private var activeDialog: AlertDialog? = null
     private var lastGamepadConfirmMs = 0L
+    // One-shot explicit force choice; scoped to the card it was made for and
+    // consumed by exactly one background prepare submission.
+    private var forceReallocationCardId: String? = null
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
@@ -693,6 +696,7 @@ class MainActivity : Activity(), ShizukuManager.Callback {
         liveCardInfo = null
         allocationSummary = null
         editorChosenByUser = false
+        forceReallocationCardId = null
         inspectionFresh = false
         inspectionFailed = false
         pendingRestoreCardId = null
@@ -734,6 +738,7 @@ class MainActivity : Activity(), ShizukuManager.Callback {
             liveCardInfo = null
             allocationSummary = null
             editorChosenByUser = false
+            forceReallocationCardId = null
             inspectionFresh = false
             inspectionFailed = false
             invalidateSummaryInfo()
@@ -816,6 +821,7 @@ class MainActivity : Activity(), ShizukuManager.Callback {
         liveCardInfo = null
         allocationSummary = null
         editorChosenByUser = false
+        forceReallocationCardId = null
         inspectionFresh = false
         inspectionFailed = false
         invalidateSummaryInfo()
@@ -892,6 +898,7 @@ class MainActivity : Activity(), ShizukuManager.Callback {
                 return
             }
             editorChosenByUser = false
+            forceReallocationCardId = null
         }
         updateAllocationLabels()
         updateControls()
@@ -937,31 +944,63 @@ class MainActivity : Activity(), ShizukuManager.Callback {
     private fun cancelReallocation() {
         if (allocationSummary == null) return
         editorChosenByUser = false
+        forceReallocationCardId = null
         updateControls()
     }
 
     private fun showReallocationBlocked(summary: AllocationSummary) {
         val title = getString(R.string.summary_move_back_title)
+        // Known occupancy and unreadable app list share one force offer: the
+        // normal migration action stays available when the entry exists, and
+        // closing remains the safe default.
         val message = if (summary.moveBackUnknown) {
             getString(R.string.summary_move_back_unknown_message)
         } else {
             getString(R.string.summary_move_back_required_message)
+        } + "\n\n" + getString(R.string.summary_force_message)
+        val card = selectedCard
+        showDialog(
+            title = title,
+            message = message,
+            positive = if (summary.migrationEntryAvailable) {
+                getString(R.string.summary_migration_entry)
+            } else {
+                getString(R.string.action_close)
+            },
+            negative = if (summary.migrationEntryAvailable) {
+                getString(R.string.action_close)
+            } else {
+                null
+            },
+            neutral = getString(R.string.summary_force_reallocate),
+            onNeutral = { enterForcedReallocation(card) },
+            onPositive = if (summary.migrationEntryAvailable) {
+                { openMigrationManager() }
+            } else {
+                null
+            },
+        )
+    }
+
+    /**
+     * Explicit force choice: opens the ordinary reallocation editor and records
+     * a one-shot force marker for the current card. It is consumed only by the
+     * next background prepare submission for that same card; changing card,
+     * cancelling, a fresh verified completion or a final confirmation all clear
+     * it, so a stale marker can never leak onto another card or run.
+     */
+    private fun enterForcedReallocation(card: ShizukuManager.CardInfo?) {
+        val summary = allocationSummary ?: return
+        if (card == null || selectedCard !== card) return
+        if (operationBusy || handoffWriting || manager.migrationActive ||
+            savedMigrationUnresolved() || !inspectionFresh
+        ) {
+            return
         }
-        if (summary.migrationEntryAvailable) {
-            showDialog(
-                title = title,
-                message = message,
-                positive = getString(R.string.summary_migration_entry),
-                negative = getString(R.string.action_close),
-                onPositive = { openMigrationManager() },
-            )
-        } else {
-            showDialog(
-                title = title,
-                message = message,
-                positive = getString(R.string.action_close),
-            )
-        }
+        if (!summary.reallocationBlocked) return
+        forceReallocationCardId = card.id
+        editorChosenByUser = true
+        updateControls()
     }
 
     private fun openMigrationManager() {
@@ -1135,32 +1174,58 @@ class MainActivity : Activity(), ShizukuManager.Callback {
 
     private fun performReview() {
         val card = selectedCard ?: return
-        if (!card.eligible || operationBusy || handoffWriting) return
+        val requestedAndroidPercent = androidPercent()
+        if (!isFreshReviewTarget(card, requestedAndroidPercent)) return
+        // One-shot force marker must belong to this exact card; a background
+        // card change invalidates it instead of forcing the new card.
+        val forced = forceReallocationCardId == card.id
+        forceReallocationCardId = null
         operationCardId = card.id
         operationMode = try {
-            AllocationMode.forPercent(100 - androidPercent())
+            AllocationMode.forPercent(100 - requestedAndroidPercent)
         } catch (t: IllegalArgumentException) {
             null
         }
-        manager.prepare(card.id, androidPercent()) { ready, error ->
+        manager.prepare(card.id, requestedAndroidPercent, forced) { ready, error ->
+            // The answer may land after the user changed cards; a mid-flight
+            // switch must never open the final wipe dialog for the old card.
+            if (!isFreshReviewTarget(card, requestedAndroidPercent)) return@prepare
             if (error != null) {
                 showError(error)
                 return@prepare
             }
             val plan = ready ?: return@prepare
-            showConfirmDialog(plan, card)
+            showConfirmDialog(plan, card, requestedAndroidPercent)
         }
     }
 
-    private fun showConfirmDialog(plan: ShizukuManager.Prepared, card: ShizukuManager.CardInfo) {
-        val cardId = plan.cardCid.ifEmpty { card.id }
+    private fun isFreshReviewTarget(
+        card: ShizukuManager.CardInfo,
+        requestedAndroidPercent: Int,
+    ): Boolean {
+        if (selectedCard !== card) return false
+        if (!card.eligible) return false
+        if (manager.currentState() != ShizukuManager.State.READY) return false
+        if (manager.migrationActive || savedMigrationUnresolved()) return false
+        if (operationBusy || handoffWriting) return false
+        if (allocationScreenState() != AllocationScreenState.EDITOR) return false
+        if (androidPercent() != requestedAndroidPercent) return false
+        return true
+    }
+
+    private fun showConfirmDialog(
+        plan: ShizukuManager.Prepared,
+        card: ShizukuManager.CardInfo,
+        requestedAndroidPercent: Int,
+    ) {
+        val planCardId = plan.cardCid.ifEmpty { card.id }
         val message = buildString {
             append(getString(R.string.confirm_message))
             append("\n\n")
             append(getString(R.string.confirm_summary_card, formatBytes(plan.diskBytes))).append('\n')
             append(getString(R.string.confirm_summary_android, formatBytes(plan.androidBytes))).append('\n')
             append(getString(R.string.confirm_summary_linux, formatBytes(plan.linuxBytes))).append('\n')
-            append(getString(R.string.confirm_summary_id, cardId))
+            append(getString(R.string.confirm_summary_id, planCardId))
         }
         showDialog(
             title = getString(R.string.confirm_title),
@@ -1168,13 +1233,19 @@ class MainActivity : Activity(), ShizukuManager.Callback {
             positive = getString(R.string.action_start),
             negative = getString(R.string.action_cancel),
             cancelable = false,
-            onPositive = { startOperation(plan.token) },
+            onPositive = {
+                if (isFreshReviewTarget(card, requestedAndroidPercent)) {
+                    startOperation(plan.token)
+                }
+            },
         )
     }
 
     private fun startOperation(token: String) {
         // A confirmed new start drops the old completion and invalidates any
         // asynchronous pending-read or write callback BEFORE the IPC/polling.
+        // The one-shot force marker is consumed by the final confirmation too.
+        forceReallocationCardId = null
         // The durable pending file itself is preserved.
         handoffLifecycle.begin()
         savedHandoff = null
@@ -1720,9 +1791,11 @@ class MainActivity : Activity(), ShizukuManager.Callback {
         message: String,
         positive: String,
         negative: String? = null,
+        neutral: String? = null,
         cancelable: Boolean = true,
         onPositive: (() -> Unit)? = null,
         onNegative: (() -> Unit)? = null,
+        onNeutral: (() -> Unit)? = null,
     ) {
         val builder = AlertDialog.Builder(this)
             .setTitle(title)
@@ -1736,6 +1809,12 @@ class MainActivity : Activity(), ShizukuManager.Callback {
             builder.setNegativeButton(negative) { dialog, _ ->
                 dialog.dismiss()
                 onNegative?.invoke()
+            }
+        }
+        if (neutral != null) {
+            builder.setNeutralButton(neutral) { dialog, _ ->
+                dialog.dismiss()
+                onNeutral?.invoke()
             }
         }
         val dialog = builder.create()
@@ -1782,6 +1861,14 @@ class MainActivity : Activity(), ShizukuManager.Callback {
         dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
             isFocusable = true
             isFocusableInTouchMode = true
+        }
+        if (neutral != null) {
+            // The force action is keyboard/gamepad reachable but never the
+            // default choice; focusing it is always an explicit D-pad move.
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.apply {
+                isFocusable = true
+                isFocusableInTouchMode = true
+            }
         }
         if (negative != null) {
             // Safe default: a confirm dialog must never implicitly target the

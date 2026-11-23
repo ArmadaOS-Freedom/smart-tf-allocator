@@ -61,11 +61,13 @@
     <string name="summary_linux_value">Linux · %1$s</string>
     <string name="summary_side_not_allocated">未分配</string>
     <string name="summary_side_unknown">未知</string>
-    <string name="summary_move_back_required">重新分配前，请先在“迁移管理”中把主存储和已安装应用从这张卡迁回。</string>
-    <string name="summary_move_back_unknown">无法读取已安装应用列表，因此已阻止重新分配。请打开“迁移管理”，先把所有内容迁回。</string>
+    <string name="summary_move_back_required">请先在“迁移管理”中把主存储和已安装应用从这张卡迁回，再重新分配。</string>
+    <string name="summary_move_back_unknown">无法读取已安装应用列表。若数据可访问，请先在“迁移管理”中迁回。</string>
     <string name="summary_move_back_title">请先迁回</string>
-    <string name="summary_move_back_required_message">这张卡仍保存着主存储或已安装应用。请先打开“迁移管理”把它们迁回 Android 存储，然后再重新分配。</string>
-    <string name="summary_move_back_unknown_message">无法读取已安装应用列表，为避免数据丢失已阻止重新分配。请打开“迁移管理”，先把所有内容迁回 Android 存储，然后重试。</string>
+    <string name="summary_move_back_required_message">这张卡仍保存着主存储或已安装应用。请先在“迁移管理”中把它们迁回 Android 存储，再重新分配。</string>
+    <string name="summary_move_back_unknown_message">无法读取已安装应用列表。若数据可访问，请先在“迁移管理”中迁回 Android 存储，再重新分配。</string>
+    <string name="summary_force_message">强制重新分配会清空整张 TF 卡，包括 Android 应用和 Linux 库。</string>
+    <string name="summary_force_reallocate">强制重新分配</string>
     <string name="summary_migration_entry">迁移管理</string>
     <string name="summary_migration_unavailable">迁移管理尚不可用。</string>
     <string name="action_reallocate">重新分配</string>

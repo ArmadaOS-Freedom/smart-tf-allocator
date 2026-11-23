@@ -81,6 +81,12 @@ class StorageUserService : IStorageService.Stub() {
 
     private var pendingPlan: AllocationPlan? = null
     private var pendingToken: String? = null
+
+    /**
+     * The current prepared token was issued by [prepareForcedReallocation] and
+     * the explicit force flag is bound to it. Reset together with the token.
+     */
+    private var pendingForce: Boolean = false
     private var knownPrivateGuids: Set<String> = emptySet()
     private var knownPublicFsUuids: Set<String> = emptySet()
 
@@ -137,9 +143,23 @@ class StorageUserService : IStorageService.Stub() {
         fail(classify(e), e)
     }
 
-    override fun prepare(diskId: String, linuxPercent: Int): String {
+    override fun prepare(diskId: String, linuxPercent: Int): String =
+        prepareInternal(diskId, linuxPercent, force = false)
+
+    override fun prepareForcedReallocation(diskId: String, linuxPercent: Int): String =
+        prepareInternal(diskId, linuxPercent, force = true)
+
+    private fun prepareInternal(
+        diskId: String,
+        linuxPercent: Int,
+        force: Boolean,
+    ): String {
         val userId = userIdForCaller(Binder.getCallingUid())
         synchronized(lock) {
+            // The force flag is bound to the prepared token: it is assigned
+            // only when a successful prepare issues a new token and is reset
+            // when that token is consumed or destroyed. A rejected prepare must
+            // never change the token that is still outstanding.
             if (state == STATE_RUNNING) {
                 return failString(ERR_BUSY, "a partition operation is already running")
             }
@@ -183,17 +203,27 @@ class StorageUserService : IStorageService.Stub() {
             } catch (e: Exception) {
                 return fail(classify(e), e)
             }
-            val blocked = try {
-                moveBackBlocked(plan.diskId, volumes, userId)
+            // Identity/query failures are thrown as typed rejections before any
+            // occupancy verdict exists. They must still pass through the same
+            // force gate so a prepared forced run can override exactly the
+            // forceable codes; every other typed rejection keeps its own code
+            // and detail unchanged.
+            var guardCode: String? = null
+            var guardDetail: String? = null
+            try {
+                guardCode = moveBackBlocked(plan.diskId, volumes, userId)
             } catch (e: MigrationRejectedException) {
-                return failString(e.code, e.message)
+                guardCode = e.code
+                guardDetail = e.message
             } catch (e: Exception) {
                 return fail(classify(e), e)
             }
-            if (blocked != null) {
+            val allowed = RepartitionPolicy.forceableRejection(guardCode, force)
+            if (allowed != null) {
                 return failString(
-                    blocked,
-                    "move primary storage and installed apps off the card before repartitioning",
+                    allowed,
+                    guardDetail
+                        ?: "move primary storage and installed apps off the card before repartitioning",
                 )
             }
             val guids = privateGuidsOn(plan.diskId, volumes)
@@ -203,6 +233,7 @@ class StorageUserService : IStorageService.Stub() {
             val token = UUID.randomUUID().toString()
             pendingPlan = plan
             pendingToken = token
+            pendingForce = force
             knownPrivateGuids = guids
             knownPublicFsUuids = publicUuids
             expectedVolumes = capturedVolumes
@@ -213,7 +244,8 @@ class StorageUserService : IStorageService.Stub() {
             log(
                 LEVEL_INFO,
                 "prepare",
-                "disk=${plan.diskId} mode=${mode.handoffName} linux_ratio=$linuxPercent",
+                "disk=${plan.diskId} mode=${mode.handoffName} " +
+                    "linux_ratio=$linuxPercent force=$force",
             )
 
             val data = JSONObject()
@@ -257,23 +289,32 @@ class StorageUserService : IStorageService.Stub() {
             } catch (e: Exception) {
                 return fail(classify(e), e)
             }
-            val blocked = try {
-                moveBackBlocked(plan.diskId, guardVolumes, userId)
+            // Same force gate as prepare: a typed rejection raised during the
+            // re-check must be overridable by the token-bound force flag, and a
+            // non-overridable typed rejection keeps its own code and detail.
+            var guardCode: String? = null
+            var guardDetail: String? = null
+            try {
+                guardCode = moveBackBlocked(plan.diskId, guardVolumes, userId)
             } catch (e: MigrationRejectedException) {
-                return failString(e.code, e.message)
+                guardCode = e.code
+                guardDetail = e.message
             } catch (e: Exception) {
                 return fail(classify(e), e)
             }
-            if (blocked != null) {
+            val allowed = RepartitionPolicy.forceableRejection(guardCode, pendingForce)
+            if (allowed != null) {
                 return failString(
-                    blocked,
-                    "move primary storage and installed apps off the card before repartitioning",
+                    allowed,
+                    guardDetail
+                        ?: "move primary storage and installed apps off the card before repartitioning",
                 )
             }
 
             // The token is single-use: consume it before doing anything else.
             pendingToken = null
             pendingPlan = null
+            pendingForce = false
             val guids = knownPrivateGuids
             val publicUuids = knownPublicFsUuids
             val capturedVolumes = expectedVolumes
@@ -979,6 +1020,7 @@ class StorageUserService : IStorageService.Stub() {
             }
             pendingPlan = null
             pendingToken = null
+            pendingForce = false
             knownPrivateGuids = emptySet()
             knownPublicFsUuids = emptySet()
             expectedVolumes = emptyList()

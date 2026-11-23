@@ -82,4 +82,35 @@ class RepartitionPolicyTest {
             RepartitionPolicy.occupancyRefusal(setOf(CARD_COMPACT, "garbage"), null, emptyList()),
         )
     }
+
+    @Test
+    fun forceableRejectionAllowsOnlyMoveBackAndAppQuery() {
+        assertNull(RepartitionPolicy.forceableRejection(MigrationErrors.MOVE_BACK_REQUIRED, true))
+        assertNull(RepartitionPolicy.forceableRejection(MigrationErrors.APP_QUERY_UNAVAILABLE, true))
+    }
+
+    @Test
+    fun forceableRejectionBlocksUnrelatedCodes() {
+        for (code in listOf(
+            MigrationErrors.CARD_MISSING,
+            MigrationErrors.CARD_CHANGED,
+            MigrationErrors.INVALID_REQUEST,
+            MigrationErrors.TARGET_MISSING,
+            MigrationErrors.SOURCE_CHANGED,
+        )) {
+            assertEquals(code, RepartitionPolicy.forceableRejection(code, true))
+        }
+    }
+
+    @Test
+    fun forceableRejectionWithForceFalseKeepsCode() {
+        assertEquals(
+            MigrationErrors.MOVE_BACK_REQUIRED,
+            RepartitionPolicy.forceableRejection(MigrationErrors.MOVE_BACK_REQUIRED, false),
+        )
+        assertEquals(
+            MigrationErrors.APP_QUERY_UNAVAILABLE,
+            RepartitionPolicy.forceableRejection(MigrationErrors.APP_QUERY_UNAVAILABLE, false),
+        )
+    }
 }
