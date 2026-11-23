@@ -61,11 +61,13 @@
     <string name="summary_linux_value">Linux · %1$s</string>
     <string name="summary_side_not_allocated">Not allocated</string>
     <string name="summary_side_unknown">Unknown</string>
-    <string name="summary_move_back_required">Move primary storage and installed apps off this card in Migration management before reallocating.</string>
-    <string name="summary_move_back_unknown">Installed apps could not be read, so reallocation is blocked. Open Migration management and move everything back first.</string>
+    <string name="summary_move_back_required">Move primary storage and installed apps off this card in Migration management, then reallocate.</string>
+    <string name="summary_move_back_unknown">Installed apps could not be read. If data is accessible, move it back in Migration management first.</string>
     <string name="summary_move_back_title">Move back first</string>
-    <string name="summary_move_back_required_message">This card still holds primary storage or installed apps. Open Migration management and move them back to Android storage first, then reallocate.</string>
-    <string name="summary_move_back_unknown_message">The installed app list could not be read, so reallocating is blocked to avoid losing data. Open Migration management, move everything back to Android storage, then retry.</string>
+    <string name="summary_move_back_required_message">This card still holds primary storage or installed apps. Move them back to Android storage in Migration management, then reallocate.</string>
+    <string name="summary_move_back_unknown_message">The installed app list could not be read. If data is accessible, move it back to Android storage in Migration management before reallocating.</string>
+    <string name="summary_force_message">Force reallocation wipes the entire TF card, including Android apps and the Linux library.</string>
+    <string name="summary_force_reallocate">Force reallocate</string>
     <string name="summary_migration_entry">Migration management</string>
     <string name="summary_migration_unavailable">Migration management is not available yet.</string>
     <string name="action_reallocate">Reallocate</string>
